@@ -38,6 +38,56 @@
 # set this to 0 to disable flow table lookup for incoming packets
 ENABLE_FLOW_LOOKUP=1
 
+# ============================================================================
+# MODE selection: DPDK (default) or AFXDP
+#
+#   make                     → builds with DPDK (original openNetVM)
+#   make MODE=AFXDP          → builds with AF_XDP datapath
+# ============================================================================
+MODE ?= DPDK
+
+# ---- AF_XDP MODE -----------------------------------------------------------
+ifeq ($(MODE),AFXDP)
+
+# The AF_XDP manager is a standalone binary — no DPDK EAL needed.
+# We compile only main.c + the AF_XDP library, link against libxdp/libbpf.
+
+CC       ?= gcc
+CFLAGS   += -O2 -Wall -Wextra -DUSE_AFXDP
+CFLAGS   += -I$(CURDIR)/afxdp
+LDLIBS   += -lxdp -lbpf -lelf -lz -lpthread
+
+APP       = onvm_mgr_afxdp
+
+SRCS      = main.c afxdp/onvm_afxdp.c
+
+OBJS      = $(SRCS:.c=.o)
+
+.PHONY: all clean bpf
+
+all: bpf $(APP)
+
+# Build the eBPF kernel object first
+bpf:
+	$(MAKE) -C afxdp
+
+$(APP): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	@echo ""
+	@echo "  Built $(APP) (AF_XDP mode)"
+	@echo "  BPF kernel object: afxdp/af_xdp_kern.o"
+	@echo ""
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(APP) $(OBJS)
+	$(MAKE) -C afxdp clean
+
+# ---- DPDK MODE (original) --------------------------------------------------
+else
+
 ifeq ($(RTE_SDK),)
 $(error "Please define RTE_SDK environment variable")
 endif
@@ -74,3 +124,5 @@ endif
 EXTRA_CFLAGS += -fno-strict-aliasing
 
 include $(RTE_SDK)/mk/rte.extapp.mk
+
+endif # MODE == DPDK

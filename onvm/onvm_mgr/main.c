@@ -49,10 +49,22 @@
 
 #include <signal.h>
 
+#ifdef USE_AFXDP
+/* AF_XDP mode: only need the AF_XDP manager header */
+#include "afxdp/onvm_afxdp.h"
+#else
+/* DPDK mode: full openNetVM manager headers */
 #include "onvm_mgr.h"
 #include "onvm_nf.h"
 #include "onvm_pkt.h"
 #include "onvm_stats.h"
+#endif
+
+#ifndef USE_AFXDP
+/*****************************************************************************
+ *  DPDK MODE: Internal declarations, worker threads, and helpers.
+ *  This entire block is compiled only when USE_AFXDP is NOT defined.
+ *****************************************************************************/
 
 /****************************Internal Declarations****************************/
 
@@ -342,9 +354,47 @@ struct queue_mgr *rx_mgr[], struct wakeup_thread_context *wakeup_ctx[]) {
                 }
         }
 }
+#endif /* !USE_AFXDP — End of DPDK-only worker threads and helpers */
+
 /*******************************Main function*********************************/
 int
 main(int argc, char *argv[]) {
+
+#ifdef USE_AFXDP
+        /******************************************************************
+         *  AF_XDP MODE
+         *
+         *  Replace the entire DPDK manager pipeline with AF_XDP sockets.
+         *  The XDP kernel program steers packets from the NIC into
+         *  userspace via XSKMAP + bpf_redirect_map(). The userspace
+         *  manager polls the AF_XDP RX ring and processes packets.
+         *
+         *  No DPDK EAL, no rte_mbuf, no hugepages required.
+         ******************************************************************/
+        struct afxdp_manager_ctx ctx;
+        int ret;
+
+        memset(&ctx, 0, sizeof(ctx));
+
+        /* Initialize: parse args, set up UMEM, create XSK, load XDP prog */
+        ret = afxdp_init(&ctx, argc, argv);
+        if (ret < 0) {
+                fprintf(stderr, "AF_XDP initialization failed (err=%d)\n", ret);
+                return -1;
+        }
+
+        /* Enter the main polling loop (blocks until shutdown signal) */
+        ret = afxdp_run(&ctx);
+
+        /* Cleanup: detach XDP, delete socket, free UMEM */
+        afxdp_cleanup(&ctx);
+
+        return ret;
+
+#else /* DPDK MODE */
+        /******************************************************************
+         *  DPDK MODE (original openNetVM manager)
+         ******************************************************************/
         unsigned cur_lcore, rx_lcores, tx_lcores, wakeup_lcores;
         unsigned nfs_per_tx, nfs_per_wakeup_thread;
         unsigned i;
@@ -488,4 +538,6 @@ onvm_free:
         RTE_LOG(ERR, APP, "Can't allocate required struct.\n");
         onvm_main_free(tx_lcores,rx_lcores, tx_mgr, rx_mgr, wakeup_ctx);
         return -1;
+
+#endif /* USE_AFXDP */
 }
