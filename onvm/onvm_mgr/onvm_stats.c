@@ -56,6 +56,15 @@
 
 /************************Internal Functions Prototypes************************/
 
+
+cJSON* onvm_json_root;
+cJSON* onvm_json_port_stats_obj;
+cJSON* onvm_json_nf_stats_obj;
+cJSON* onvm_json_port_stats[RTE_MAX_ETHPORTS];
+cJSON* onvm_json_nf_stats[MAX_NFS];
+cJSON* onvm_json_events_arr;
+
+
 /*
  * Function to send json events to web view
  *

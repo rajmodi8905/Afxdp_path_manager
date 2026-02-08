@@ -216,6 +216,8 @@ afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv) {
                         sizeof(cfg->xdp_prog_name) - 1);
         }
 
+	cfg->custom_xdp_prog = true;
+
         AFXDP_LOG_INFO("Configuration:");
         AFXDP_LOG_INFO("  Interface:   %s (index %d)", cfg->ifname, cfg->ifindex);
         AFXDP_LOG_INFO("  RX Queue:    %d", cfg->xsk_if_queue);

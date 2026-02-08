@@ -74,20 +74,20 @@
 /******************************Global Variables*******************************/
 
 // Shared data for host port information
-struct port_info *ports;
+extern struct port_info *ports;
 
 // Shared data for core information
-struct core_status *cores;
+extern struct core_status *cores;
 
 // ring used for NF -> mgr messages (like startup & shutdown)
 static struct rte_ring *mgr_msg_queue;
 
 // Shared data from server. We update statistics here
-struct onvm_nf *nfs;
+extern struct onvm_nf *nfs;
 
 // Shared data from manager, has information used for nf_side tx
-uint16_t **services;
-uint16_t *nf_per_service_count;
+extern uint16_t **services;
+extern uint16_t *nf_per_service_count;
 
 // Shared pool for all NFs info
 static struct rte_mempool *nf_init_cfg_mp;
@@ -102,13 +102,13 @@ static struct onvm_nf_local_ctx *main_nf_local_ctx;
 static handle_signal_func global_nf_signal_handler = NULL;
 
 // Shared data for default service chain
-struct onvm_service_chain *default_chain;
+extern struct onvm_service_chain *default_chain;
 
 /* Shared data for onvm config */
-struct onvm_configuration *onvm_config;
+extern struct onvm_configuration *onvm_config;
 
 /* Flag to check if shared core mutex sleep/wakeup is enabled */
-uint8_t ONVM_NF_SHARE_CORES;
+extern uint8_t ONVM_NF_SHARE_CORES;
 
 /***********************Internal Functions Prototypes*************************/
 
