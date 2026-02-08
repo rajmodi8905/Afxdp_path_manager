@@ -158,12 +158,12 @@ zgrep -E 'CONFIG_BPF|CONFIG_XDP' /proc/config.gz
 
 | File | Purpose | Lines | Compiled |
 |------|---------|-------|----------|
-| `af_xdp_kern.c` | XDP eBPF kernel program | 140 | Yes (BPF bytecode) |
-| `onvm_afxdp.c` | Main AF_XDP manager implementation | 908 | Yes (userspace) |
-| `onvm_afxdp.h` | Public API declarations | 117 | No (header) |
-| `onvm_afxdp_types.h` | Type definitions and includes | 228 | No (header) |
-| `onvm_afxdp_config.h` | Configuration constants | 150 | No (header) |
-| `Makefile` | Build script for XDP kernel program | 40 | No |
+| `af_xdp_kern.c` | XDP eBPF kernel program | 133 | Yes (BPF bytecode) |
+| `onvm_afxdp.c` | Main AF_XDP manager implementation | 909 | Yes (userspace) |
+| `onvm_afxdp.h` | Public API declarations | 127 | No (header) |
+| `onvm_afxdp_types.h` | Type definitions and includes | 227 | No (header) |
+| `onvm_afxdp_config.h` | Configuration constants | 148 | No (header) |
+| `Makefile` | Build script for XDP kernel program | 26 | No |
 
 ### Workflow by File
 
@@ -718,34 +718,42 @@ file af_xdp_kern.o
 # Should show: "ELF 64-bit LSB relocatable, eBPF, version 1 (SYSV)"
 ```
 
-#### 2. Build OpenNetVM with AF_XDP Support
+#### 2. Build OpenNetVM Manager with AF_XDP Support
 ```bash
-cd onvm
-make clean
-make USE_AFXDP=1
+cd onvm/onvm_mgr
+make MODE=AFXDP
 ```
 
 **What Happens**:
-- Compiles `onvm_mgr/main.c` with `-DUSE_AFXDP`
-- Links against `libbpf` and `libxdp`
-- Compiles `onvm_afxdp.c` into the manager binary
+- Runs `make -C afxdp` to compile `af_xdp_kern.o` (eBPF bytecode)
+- Compiles `main.c` with `-DUSE_AFXDP`
+- Compiles `afxdp/onvm_afxdp.c`
+- Links against `-lxdp -lbpf -lelf -lz -lpthread`
+- Produces `onvm_mgr_afxdp` binary
 
-**Build Flags**:
+**Build Flags** (from `onvm_mgr/Makefile`):
 ```makefile
-CFLAGS += -DUSE_AFXDP
-LDFLAGS += -lbpf -lxdp
+CFLAGS += -O2 -Wall -Wextra -DUSE_AFXDP -I$(CURDIR)/afxdp
+LDLIBS += -lxdp -lbpf -lelf -lz -lpthread
 ```
 
 #### 3. Verify Build
 ```bash
-cd onvm_mgr
-./onvm_mgr -h
-# Should show AF_XDP-specific options (-d, -Q, etc.)
+cd onvm/onvm_mgr
 
-ldd onvm_mgr | grep -E 'libbpf|libxdp'
+# Check the binary exists
+file onvm_mgr_afxdp
+# Should show: ELF 64-bit LSB executable, x86-64
+
+# Check linked libraries
+ldd onvm_mgr_afxdp | grep -E 'libbpf|libxdp'
 # Should show:
 #   libbpf.so.0 => /usr/lib/x86_64-linux-gnu/libbpf.so.0
 #   libxdp.so.1 => /usr/lib/x86_64-linux-gnu/libxdp.so.1
+
+# Check eBPF object
+file afxdp/af_xdp_kern.o
+# Should show: ELF 64-bit LSB relocatable, eBPF
 ```
 
 ### Troubleshooting Build Issues
@@ -775,7 +783,7 @@ clang-12 -target bpf -c af_xdp_kern.c -o af_xdp_kern.o
 
 ### Example 1: Basic Usage (Default Settings)
 ```bash
-sudo ./onvm_mgr -d eth0
+sudo ./onvm_mgr_afxdp -d eth0
 ```
 - Binds to `eth0` interface, queue 0
 - Native XDP mode (auto)
@@ -821,7 +829,7 @@ TX: 1234567 packets, 987654321 bytes
 
 ### Example 2: Verbose Mode with Statistics
 ```bash
-sudo ./onvm_mgr -d enp1s0 -Q 1 -v
+sudo ./onvm_mgr_afxdp -d enp1s0 -Q 1 -v
 ```
 - Binds to `enp1s0`, queue 1
 - Verbose statistics every 2 seconds
@@ -836,7 +844,7 @@ AF_XDP RX:      1,234,567 pkts (   617,283 pps)     987,654 Kbytes (  3950 Mbits
 
 ### Example 3: Poll Mode (CPU-Friendly)
 ```bash
-sudo ./onvm_mgr -d eth0 -p -v
+sudo ./onvm_mgr_afxdp -d eth0 -p -v
 ```
 - Poll mode: uses `poll()` syscall instead of busy-wait
 - Saves CPU when idle
@@ -848,7 +856,7 @@ sudo ./onvm_mgr -d eth0 -p -v
 
 ### Example 4: Force Copy Mode
 ```bash
-sudo ./onvm_mgr -d eth0 -c -v
+sudo ./onvm_mgr_afxdp -d eth0 -c -v
 ```
 - Forces copy mode (disables zero-copy)
 - Useful for debugging or unsupported NICs
@@ -857,7 +865,7 @@ sudo ./onvm_mgr -d eth0 -c -v
 
 ### Example 5: Generic (SKB) XDP Mode
 ```bash
-sudo ./onvm_mgr -d eth0 -S -v
+sudo ./onvm_mgr_afxdp -d eth0 -S -v
 ```
 - Uses generic XDP (works on any NIC)
 - No driver support needed
@@ -869,10 +877,10 @@ sudo ./onvm_mgr -d eth0 -S -v
 ### Example 6: Auto-Shutdown After Time or Packets
 ```bash
 # Run for 60 seconds then exit
-sudo ./onvm_mgr -d eth0 -t 60 -v
+sudo ./onvm_mgr_afxdp -d eth0 -t 60 -v
 
 # Run until 1 million packets received
-sudo ./onvm_mgr -d eth0 -l 1000000 -v
+sudo ./onvm_mgr_afxdp -d eth0 -l 1000000 -v
 ```
 
 **Use Case**: Automated testing and benchmarking
@@ -882,13 +890,13 @@ sudo ./onvm_mgr -d eth0 -l 1000000 -v
 ### Example 7: Multi-Queue Setup
 ```bash
 # Terminal 1: Bind to queue 0
-sudo ./onvm_mgr -d eth0 -Q 0 -v &
+sudo ./onvm_mgr_afxdp -d eth0 -Q 0 -v &
 
 # Terminal 2: Bind to queue 1
-sudo ./onvm_mgr -d eth0 -Q 1 -v &
+sudo ./onvm_mgr_afxdp -d eth0 -Q 1 -v &
 
 # Terminal 3: Bind to queue 2
-sudo ./onvm_mgr -d eth0 -Q 2 -v &
+sudo ./onvm_mgr_afxdp -d eth0 -Q 2 -v &
 ```
 
 **Note**: Each queue needs a separate manager instance. The XDP program will redirect each queue's packets to its respective AF_XDP socket.
@@ -897,7 +905,7 @@ sudo ./onvm_mgr -d eth0 -Q 2 -v &
 
 ### Example 8: Custom XDP Program
 ```bash
-sudo ./onvm_mgr -d eth0 -f my_custom_xdp.o -P my_prog_section
+sudo ./onvm_mgr_afxdp -d eth0 -f my_custom_xdp.o -P my_prog_section
 ```
 - Loads custom XDP program from `my_custom_xdp.o`
 - Uses section name `my_prog_section`
@@ -912,7 +920,7 @@ sudo ./onvm_mgr -d eth0 -f my_custom_xdp.o -P my_prog_section
 #### Test 1: Verify XDP Program Loading
 ```bash
 # Start manager
-sudo ./onvm_mgr -d eth0 -v
+sudo ./onvm_mgr_afxdp -d eth0 -v
 
 # In another terminal, check XDP status
 sudo ip link show eth0
@@ -936,7 +944,7 @@ sudo bpftool map show
 # - Host B (10.0.0.2): Traffic generator
 
 # On Host A
-sudo ./onvm_mgr -d eth0 -v
+sudo ./onvm_mgr_afxdp -d eth0 -v
 
 # On Host B (generate traffic)
 ping -c 100 10.0.0.1
@@ -956,7 +964,7 @@ sudo ethtool -L eth0 combined 4
 
 # Start managers on each queue
 for q in 0 1 2 3; do
-    sudo ./onvm_mgr -d eth0 -Q $q -v -l 10000 &
+    sudo ./onvm_mgr_afxdp -d eth0 -Q $q -v -l 10000 &
 done
 
 # Generate traffic to hit multiple queues
@@ -987,7 +995,7 @@ dst_mac aa:bb:cc:dd:ee:ff
 EOF
 
 # Start manager
-sudo ./onvm_mgr -d eth0 -v
+sudo ./onvm_mgr_afxdp -d eth0 -v
 
 # In another terminal, start pktgen
 echo "start" | sudo tee /proc/net/pktgen/pgctrl
@@ -1004,7 +1012,7 @@ cat /proc/net/pktgen/eth0
 sudo apt-get install sockperf
 
 # On receiver (with AF_XDP manager)
-sudo ./onvm_mgr -d eth0 -v
+sudo ./onvm_mgr_afxdp -d eth0 -v
 
 # On sender
 sockperf ping-pong -i 10.0.0.1 -p 11111 --pps 1000 --time 60
@@ -1020,7 +1028,7 @@ sockperf ping-pong -i 10.0.0.1 -p 11111 --pps 1000 --time 60
 #### Test 3: CPU Utilization
 ```bash
 # Start manager
-sudo ./onvm_mgr -d eth0 -v &
+sudo ./onvm_mgr_afxdp -d eth0 -v &
 PID=$!
 
 # Monitor CPU usage
@@ -1037,7 +1045,7 @@ top -p $PID
 #### Test 1: Packet Drop Under Load
 ```bash
 # Start manager
-sudo ./onvm_mgr -d eth0 -v
+sudo ./onvm_mgr_afxdp -d eth0 -v
 
 # Generate high packet rate
 sudo pkt-gen -i eth0 -f tx -r 10000000  # 10 Mpps
@@ -1055,7 +1063,7 @@ sudo apt-get install valgrind
 
 # Run manager under valgrind
 sudo valgrind --leak-check=full --show-leak-kinds=all \
-    ./onvm_mgr -d eth0 -t 30 -v
+    ./onvm_mgr_afxdp -d eth0 -t 30 -v
 
 # Check for memory leaks in output
 ```
@@ -1066,7 +1074,7 @@ sudo valgrind --leak-check=full --show-leak-kinds=all \
 
 #### Test 1: Invalid Interface
 ```bash
-sudo ./onvm_mgr -d invalid_if
+sudo ./onvm_mgr_afxdp -d invalid_if
 # Expected: Error message and exit
 ```
 
@@ -1075,7 +1083,7 @@ sudo ./onvm_mgr -d invalid_if
 #### Test 2: Permission Denied
 ```bash
 # Run without sudo
-./onvm_mgr -d eth0
+./onvm_mgr_afxdp -d eth0
 # Expected: Permission error or capability error
 ```
 
@@ -1084,10 +1092,10 @@ sudo ./onvm_mgr -d invalid_if
 #### Test 3: XDP Already Attached
 ```bash
 # Start first instance
-sudo ./onvm_mgr -d eth0 &
+sudo ./onvm_mgr_afxdp -d eth0 &
 
 # Try to start second instance on same queue
-sudo ./onvm_mgr -d eth0 -Q 0
+sudo ./onvm_mgr_afxdp -d eth0 -Q 0
 # Expected: Error (XDP program already attached)
 ```
 
@@ -1107,10 +1115,10 @@ Test on various drivers:
 ethtool -i eth0 | grep driver
 
 # Test native mode
-sudo ./onvm_mgr -d eth0 -N -v
+sudo ./onvm_mgr_afxdp -d eth0 -N -v
 
 # Test SKB mode
-sudo ./onvm_mgr -d eth0 -S -v
+sudo ./onvm_mgr_afxdp -d eth0 -S -v
 ```
 
 ---
@@ -1159,7 +1167,7 @@ cd tools/Pktgen
 ./MoonGen examples/l2-forward.lua 0 1
 
 # Manager should receive and bounce packets
-sudo ./onvm_mgr -d eth1 -v
+sudo ./onvm_mgr_afxdp -d eth1 -v
 ```
 
 ---
@@ -1172,7 +1180,7 @@ sudo ./onvm_mgr -d eth1 -v
 set -e
 
 IFACE="eth0"
-MGR="./onvm_mgr"
+MGR="./onvm_mgr_afxdp"
 
 echo "=== AF_XDP Regression Tests ==="
 
@@ -1219,7 +1227,7 @@ echo "=== All Tests Passed ==="
 ip link show
 
 # Use correct interface name
-sudo ./onvm_mgr -d <correct_interface_name>
+sudo ./onvm_mgr_afxdp -d <correct_interface_name>
 ```
 
 ---
@@ -1230,11 +1238,11 @@ sudo ./onvm_mgr -d <correct_interface_name>
 **Solution**:
 ```bash
 # Run with sudo
-sudo ./onvm_mgr -d eth0
+sudo ./onvm_mgr_afxdp -d eth0
 
 # Or grant capabilities
-sudo setcap cap_net_admin,cap_sys_admin,cap_bpf+ep ./onvm_mgr
-./onvm_mgr -d eth0
+sudo setcap cap_net_admin,cap_sys_admin,cap_bpf+ep ./onvm_mgr_afxdp
+./onvm_mgr_afxdp -d eth0
 ```
 
 ---
@@ -1248,10 +1256,10 @@ sudo setcap cap_net_admin,cap_sys_admin,cap_bpf+ep ./onvm_mgr
 sudo ip link set dev eth0 xdp off
 
 # Try again
-sudo ./onvm_mgr -d eth0
+sudo ./onvm_mgr_afxdp -d eth0
 
 # If still fails, try SKB mode
-sudo ./onvm_mgr -d eth0 -S
+sudo ./onvm_mgr_afxdp -d eth0 -S
 ```
 
 ---
@@ -1265,10 +1273,10 @@ sudo ./onvm_mgr -d eth0 -S
 ethtool -l eth0
 
 # Use valid queue index (0 to N-1)
-sudo ./onvm_mgr -d eth0 -Q 0
+sudo ./onvm_mgr_afxdp -d eth0 -Q 0
 
 # Try copy mode if zero-copy fails
-sudo ./onvm_mgr -d eth0 -c
+sudo ./onvm_mgr_afxdp -d eth0 -c
 ```
 
 ---
@@ -1321,7 +1329,7 @@ ping -I eth0 8.8.8.8
 #define AFXDP_RX_RING_SIZE 4096  // Was 2048
 
 # Rebuild and test
-make clean && make USE_AFXDP=1
+make clean && make MODE=AFXDP
 ```
 
 ---
@@ -1368,7 +1376,7 @@ sudo bpftool prog load af_xdp_kern.o /sys/fs/bpf/test_prog
 Enable verbose logging for troubleshooting:
 ```bash
 # Verbose AF_XDP manager
-sudo ./onvm_mgr -d eth0 -v
+sudo ./onvm_mgr_afxdp -d eth0 -v
 
 # Kernel BPF debug logs
 sudo sysctl kernel.printk="7 7 7 7"
@@ -1384,7 +1392,7 @@ sudo bpftrace -e 'tracepoint:xdp:xdp_redirect* { printf("%s\n", comm); }'
 
 ### 🐛 Bug 1: Race Condition in TX Completion
 
-**Location**: [onvm_afxdp.c](onvm_afxdp.c#L540-L560) - `afxdp_complete_tx()`
+**Location**: [onvm_afxdp.c](onvm_afxdp.c#L431) - `afxdp_complete_tx()`
 
 **Issue**: The `outstanding_tx` counter can underflow if completion happens faster than expected.
 
@@ -1408,7 +1416,7 @@ __atomic_fetch_sub(&xsk->outstanding_tx, completed, __ATOMIC_RELAXED);
 
 ### 🐛 Bug 2: Infinite Loop in Fill Ring Refill
 
-**Location**: [onvm_afxdp.c](onvm_afxdp.c#L542-L546) - `afxdp_handle_receive()`
+**Location**: [onvm_afxdp.c](onvm_afxdp.c#L527) - `afxdp_handle_receive()`
 
 **Issue**: The retry loop can hang if ring reservation always fails.
 
@@ -1440,7 +1448,7 @@ if (ret != (int)stock_frames) {
 
 ### 🐛 Bug 3: No Validation of Queue Index
 
-**Location**: [onvm_afxdp.c](onvm_afxdp.c#L160) - `afxdp_parse_args()`
+**Location**: [onvm_afxdp.c](onvm_afxdp.c#L132) - `afxdp_parse_args()`
 
 **Issue**: The `-Q` flag doesn't validate the queue index against NIC capabilities.
 
@@ -1480,7 +1488,7 @@ if (cfg->xsk_if_queue >= channels.combined_count) {
 
 ### 🐛 Bug 4: Memory Leak on Init Failure
 
-**Location**: [onvm_afxdp.c](onvm_afxdp.c#L696-L809) - `afxdp_init()`
+**Location**: [onvm_afxdp.c](onvm_afxdp.c#L700) - `afxdp_init()`
 
 **Issue**: If initialization fails partway through, not all resources are freed.
 
@@ -1538,7 +1546,7 @@ err_out:
 
 ### 🐛 Bug 5: Stats Thread Not Initialized
 
-**Location**: [onvm_afxdp.c](onvm_afxdp.c#L881-L886) - `afxdp_cleanup()`
+**Location**: [onvm_afxdp.c](onvm_afxdp.c#L853) - `afxdp_cleanup()`
 
 **Issue**: `ctx->stats_thread` is never explicitly initialized to 0 or NULL.
 
@@ -1576,7 +1584,7 @@ if (ctx->stats_thread_running) {
 
 ### 🐛 Bug 6: Signal Handler Race Condition
 
-**Location**: [onvm_afxdp.c](onvm_afxdp.c#L104-L109) - `afxdp_signal_handler()`
+**Location**: [onvm_afxdp.c](onvm_afxdp.c#L95-L101) - `afxdp_signal_handler()`
 
 **Issue**: Global pointer `g_ctx` is not thread-safe and can be accessed during initialization.
 
@@ -1590,11 +1598,11 @@ static void afxdp_signal_handler(int signum) {
     }
 }
 
-// In afxdp_init():
-g_ctx = ctx;  // Set after signal handlers installed
+// In afxdp_init() (line 706):
+g_ctx = ctx;  // Set before signal handlers are installed
 ```
 
-**Problem**: If SIGINT arrives between signal() and `g_ctx = ctx`, handler accesses NULL pointer.
+**Problem**: Although `g_ctx` is set before `signal()` calls, `global_exit` is not explicitly zeroed first, and there is no memory barrier between setting `g_ctx` and installing the handlers.
 
 **Impact**: Low - very narrow race window
 
@@ -1709,10 +1717,10 @@ Recommended = 8192 (power of 2)
 Pin manager to specific CPU core:
 ```bash
 # Pin to core 0
-sudo taskset -c 0 ./onvm_mgr -d eth0 -v
+sudo taskset -c 0 ./onvm_mgr_afxdp -d eth0 -v
 
 # Or use numactl for NUMA-aware pinning
-sudo numactl --cpunodebind=0 --membind=0 ./onvm_mgr -d eth0 -v
+sudo numactl --cpunodebind=0 --membind=0 ./onvm_mgr_afxdp -d eth0 -v
 ```
 
 ---
@@ -1739,7 +1747,7 @@ sudo ethtool -L eth0 combined 4
 
 # Start manager on each queue
 for q in 0 1 2 3; do
-    sudo taskset -c $q ./onvm_mgr -d eth0 -Q $q -v &
+    sudo taskset -c $q ./onvm_mgr_afxdp -d eth0 -Q $q -v &
 done
 ```
 
@@ -1775,7 +1783,7 @@ Ensure zero-copy is enabled:
 sudo ethtool -k eth0 | grep xdp
 
 # Force zero-copy mode
-sudo ./onvm_mgr -d eth0 -z -v
+sudo ./onvm_mgr_afxdp -d eth0 -z -v
 ```
 
 **Verify**:
@@ -1806,7 +1814,7 @@ sudo ethtool -K eth0 tso off gso off gro off
 
 **Use `perf` to profile hotspots**:
 ```bash
-sudo perf record -g ./onvm_mgr -d eth0 -t 60
+sudo perf record -g ./onvm_mgr_afxdp -d eth0 -t 60
 sudo perf report
 ```
 

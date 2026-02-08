@@ -2,14 +2,53 @@ openNetVM
 ==
 openNetVM is comprised of a manager, NF library, and a TCP/IP library.
 
+This fork adds an **AF_XDP datapath** alongside the original DPDK datapath.
+See [AF_XDP Manager README](onvm_mgr/afxdp/README.md) for the full reference.
+
 Manager
 --
 The openNetVM manager is responsible for orchestrating traffic between NFs.  It handles all Rx/Tx traffic in and out of the system, dynamically manages NFs starting and stopping, and it displays statistics regarding all traffic.
 
-```
-$sudo ./onvm_mgr/onvm_mgr/x86_64-native-linuxapp-gcc/onvm_mgr -l CORELIST -n MEMORY_CHANNELS --proc-type=primary -- -p PORTMASK -n NF_COREMASK [-r NUM_SERVICES] [-d DEFAULT_SERVICE] [-s STATS_OUTPUT] [-t TIME_TO_LIVE] [-l PACKET_LIMIT] 
+The manager supports two build modes:
 
-Options:
+| Mode | Build command | Binary produced |
+|------|---------------|-----------------|
+| DPDK (default) | `cd onvm && make` | `onvm_mgr/x86_64-native-linuxapp-gcc/onvm_mgr` |
+| AF_XDP | `cd onvm/onvm_mgr && make MODE=AFXDP` | `onvm_mgr/onvm_mgr_afxdp` |
+
+### DPDK Mode
+
+```
+sudo ./onvm_mgr/x86_64-native-linuxapp-gcc/onvm_mgr -l CORELIST -n MEMORY_CHANNELS --proc-type=primary -- -p PORTMASK -n NF_COREMASK [-r NUM_SERVICES] [-d DEFAULT_SERVICE] [-s STATS_OUTPUT] [-t TIME_TO_LIVE] [-l PACKET_LIMIT]
+```
+
+Or use the helper script:
+```
+./go.sh -k 1 -n 0xF8 -s stdout
+```
+
+### AF_XDP Mode
+
+```bash
+# Build
+cd onvm/onvm_mgr && make MODE=AFXDP
+
+# Run (requires root)
+sudo ./onvm_mgr/onvm_mgr_afxdp -d <interface> [-Q queue] [-v] [-S|-N] [-c|-z] [-p] [-t sec] [-l pkts]
+```
+
+Key source files live in `onvm_mgr/afxdp/`:
+
+| File | Purpose |
+|------|---------|
+| `af_xdp_kern.c` | XDP eBPF kernel program (133 lines) |
+| `onvm_afxdp.c` | Userspace AF_XDP manager (909 lines) |
+| `onvm_afxdp.h` | Public API: `afxdp_init`, `afxdp_run`, `afxdp_cleanup` (127 lines) |
+| `onvm_afxdp_types.h` | Data structures (227 lines) |
+| `onvm_afxdp_config.h` | Tunable parameters (148 lines) |
+| `Makefile` | eBPF kernel object build (26 lines) |
+
+### DPDK Mode Options
 
         -c      an hexadecimal bit mask of the cores to run on.
 
@@ -58,8 +97,15 @@ Options:
 
 Usage
 --
-The manager default base virtual address is by default set to `0x7f000000000`. To configure to a specific address please use '--base-virtaddr' option, please use the `-a` flag for the onvm_mgr: 
+### DPDK Mode
+The manager default base virtual address is set to `0x7f000000000`. To override, use the `-a` flag:
 - `onvm/go.sh -k 1 -n 0x3F8 -s stdout -a 0x7f000000000`
+
+### AF_XDP Mode
+The AF_XDP binary does not use DPDK EAL — just pass the interface name:
+- `sudo ./onvm_mgr/onvm_mgr_afxdp -d eth0 -v`
+
+See [AF_XDP Manager README](onvm_mgr/afxdp/README.md) for all flags and examples.
 
 NF Library
 --
