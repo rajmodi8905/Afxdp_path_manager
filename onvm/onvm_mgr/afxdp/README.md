@@ -10,9 +10,6 @@
 7. [Building and Compilation](#building-and-compilation)
 8. [Usage Examples](#usage-examples)
 9. [Testing Methods](#testing-methods)
-10. [Troubleshooting](#troubleshooting)
-11. [Known Issues and Bugs](#known-issues-and-bugs)
-12. [Performance Tuning](#performance-tuning)
 
 ---
 
@@ -1810,68 +1807,4 @@ sudo ethtool -K eth0 tso off gso off gro off
 
 ---
 
-### 10. Monitoring and Profiling
 
-**Use `perf` to profile hotspots**:
-```bash
-sudo perf record -g ./onvm_mgr_afxdp -d eth0 -t 60
-sudo perf report
-```
-
-**Monitor with `bpftool`**:
-```bash
-# Watch map updates
-watch -n 1 sudo bpftool map dump name xdp_stats_map
-```
-
-**Check NIC stats**:
-```bash
-watch -n 1 ethtool -S eth0
-```
-
----
-
-## Conclusion
-
-This AF_XDP implementation provides a high-performance, zero-copy packet I/O path for OpenNetVM. Key benefits include:
-
-✅ **Kernel bypass** - Direct NIC-to-userspace DMA  
-✅ **Zero-copy** - Packets never copied between kernel and userspace  
-✅ **Flexible** - Works on commodity hardware with standard Linux  
-✅ **Scalable** - Multi-queue support for parallel processing  
-
-**Current Status**: Functional proof-of-concept with simple packet bouncing. Ready for integration with full NF manager functionality.
-
-**Next Steps**:
-1. Fix identified bugs (see Known Issues section)
-2. Integrate with NF chain processing
-3. Add packet filtering and steering logic
-4. Implement multi-NF support with separate sockets per NF
-
----
-
-## References
-
-- [XDP Project Tutorial](https://github.com/xdp-project/xdp-tutorial)
-- [AF_XDP Documentation](https://www.kernel.org/doc/html/latest/networking/af_xdp.html)
-- [libbpf Documentation](https://libbpf.readthedocs.io/)
-- [OpenNetVM Documentation](https://github.com/sdnfv/openNetVM/tree/master/docs)
-
----
-
-## Questions?
-
-If you have questions or encounter issues not covered in this README:
-
-1. Check kernel logs: `sudo dmesg | tail`
-2. Enable verbose mode: `-v` flag
-3. Inspect BPF maps: `sudo bpftool map dump name xsks_map`
-4. Review source code comments for detailed explanations
-
-**Contact**: OpenNetVM team at https://sdnfv.github.io/onvm/
-
----
-
-*Last Updated: 2026-02-06*  
-*Version: 1.0.0*  
-*Author: AF_XDP Integration Team*
