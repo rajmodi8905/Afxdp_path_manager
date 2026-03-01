@@ -145,4 +145,33 @@
 #define AFXDP_LOG_ERR(fmt, ...)   fprintf(stderr, "[AFXDP ERROR] " fmt "\n", ##__VA_ARGS__)
 #define AFXDP_LOG_WARN(fmt, ...)  fprintf(stderr, "[AFXDP WARN] " fmt "\n", ##__VA_ARGS__)
 
+/**********************Hugepage Pool Partitioning*****************************/
+
+/* Size of one x86 large (2 MiB) hugepage in bytes. */
+#define AFXDP_HUGEPAGE_SIZE          (2ULL * 1024 * 1024)
+
+/* Raw UMEM size: AFXDP_NUM_FRAMES frames of AFXDP_FRAME_SIZE each. */
+#define AFXDP_UMEM_TOTAL_BYTES       ((uint64_t)AFXDP_NUM_FRAMES * AFXDP_FRAME_SIZE)
+
+/* Actual mmap size — rounded up to the next 2 MiB boundary so the
+ * allocation covers whole hugepages and does not share a page with
+ * any other allocator (including DPDK). */
+#define AFXDP_UMEM_HUGEPAGE_ALIGNED \
+        (((AFXDP_UMEM_TOTAL_BYTES) + AFXDP_HUGEPAGE_SIZE - 1) \
+         & ~(AFXDP_HUGEPAGE_SIZE - 1))
+
+/* Maximum memory (MB per NUMA socket) that the DPDK EAL is permitted
+ * to claim from the hugepage pool.  Set this via --socket-mem in
+ * go.sh.  The gap between this value and the total hugepage reservation
+ * (ONVM_NUM_HUGEPAGES × 2 MB, default 2048 MB) is reserved for the
+ * AF_XDP UMEM region so both managers share the pool without overlap.
+ *
+ * Default:  2048 MB total  −  16 MB AF_XDP UMEM  =  2032 MB for DPDK.
+ * We round down to 1792 MB to leave comfortable headroom. */
+#define AFXDP_DPDK_SOCKET_MEM_MB     1792
+
+/* Returned by afxdp_get_nic_numa_node() when the NIC's NUMA node
+ * cannot be determined (single-socket machine or sysfs unavailable). */
+#define AFXDP_NUMA_NODE_UNKNOWN      (-1)
+
 #endif /* _ONVM_AFXDP_CONFIG_H_ */

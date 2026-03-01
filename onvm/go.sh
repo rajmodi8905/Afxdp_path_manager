@@ -119,7 +119,7 @@ while getopts "a:r:d:s:t:l:p:z:cvm:k:n:j" opt; do
         d) def_srvc="-d $OPTARG";;
         s) stats="-s $OPTARG";;
         t) ttl="-t $OPTARG";;
-        l) packet_limit="-l $OPTARG";;
+        l) packet_limit="xdp $OPTARG";;
         p) web_port="$OPTARG";;
         z) stats_sleep_time="-z $OPTARG";;
         c) shared_cpu_flag="-c";;
@@ -270,9 +270,17 @@ then
 fi
 
 sudo rm -rf /mnt/huge/rtemap_*
+
+# ONVM_DPDK_SOCKET_MEM caps how many MB per NUMA socket DPDK may claim from
+# the hugepage pool.  The remainder is reserved for the AF_XDP UMEM region
+# (pre-allocated before rte_eal_init — see onvm_afxdp_config.h).
+# Default: 1792 MB  (total reservation 2048 MB - 256 MB headroom for AF_XDP).
+# Override with:  export ONVM_DPDK_SOCKET_MEM=<MB>
+: "${ONVM_DPDK_SOCKET_MEM:=1792}"
+
 # watch out for variable expansion
 # shellcheck disable=SC2086
-sudo "$SCRIPTPATH"/onvm_mgr/"$RTE_TARGET"/onvm_mgr -l "$cpu" -n 4 --proc-type=primary ${virt_addr} -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
+sudo "$SCRIPTPATH"/onvm_mgr/"$RTE_TARGET"/onvm_mgr -l "$cpu" -n 4 --proc-type=primary ${virt_addr} --socket-mem=${ONVM_DPDK_SOCKET_MEM} -- -p ${ports} -n ${nf_cores} ${num_srvc} ${def_srvc} ${stats} ${stats_sleep_time} ${verbosity_level} ${ttl} ${packet_limit} ${shared_cpu_flag} ${jumbo_frames_flag}
 
 if [ "${stats}" = "-s web" ]
 then

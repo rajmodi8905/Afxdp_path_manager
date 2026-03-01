@@ -207,8 +207,12 @@ struct afxdp_manager_ctx {
 
         /* UMEM region */
         struct afxdp_umem_info *umem;
-        void *packet_buffer;                  /* Raw allocated buffer (for free) */
-        uint64_t packet_buffer_size;
+        void *packet_buffer;                  /* Raw allocated buffer             */
+        uint64_t packet_buffer_size;          /* logical UMEM size (frames×frame) */
+        uint64_t packet_buffer_size_aligned;  /* actual mmap size (2 MiB aligned) */
+        bool     use_hugepages;               /* true → munmap; false → free()    */
+        bool     hugepage_preallocated;       /* pre-alloc'd before rte_eal_init()*/
+
 
         /* Primary AF_XDP socket (ingress) */
         struct afxdp_socket_info *xsk_socket;

@@ -64,6 +64,15 @@
 
 #include "onvm_afxdp.h"
 
+#include <sys/mman.h>    /* mmap, munmap, MAP_HUGETLB, MAP_ANONYMOUS */
+#include <sys/syscall.h> /* syscall, __NR_mbind                        */
+
+/* MAP_HUGE_2MB: request 2 MiB pages when combined with MAP_HUGETLB.
+ * Defined in <linux/mman.h> on modern kernels; provide fallback. */
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB  (21 << 26)
+#endif
+
 /****************************Forward Declarations*****************************/
 
 static void afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv);
@@ -85,6 +94,11 @@ static bool afxdp_process_packet(struct afxdp_socket_info *xsk,
 
 /* Timing utility */
 static uint64_t afxdp_gettime(void);
+
+/* Hugepage UMEM buffer management */
+static int  afxdp_get_nic_numa_node(const char *ifname);
+static void afxdp_bind_numa(void *addr, uint64_t size, int numa_node);
+static int  afxdp_alloc_hugepage_buffer(struct afxdp_manager_ctx *ctx, const char *ifname);
 
 /***********************Signal Handler (module-level)*************************/
 
@@ -229,6 +243,147 @@ afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv) {
                 AFXDP_LOG_INFO("  TTL:         %u seconds", cfg->time_to_live);
         if (cfg->pkt_limit)
                 AFXDP_LOG_INFO("  Pkt Limit:   %lu", cfg->pkt_limit);
+}
+
+/****************************************************************************
+ *
+ *           HUGEPAGE UMEM BUFFER MANAGEMENT
+ *
+ ****************************************************************************/
+
+/*
+ * Read the NUMA node of a network interface from sysfs.
+ * Returns AFXDP_NUMA_NODE_UNKNOWN if the file is absent or unreadable
+ * (single-socket machine, virtual interface, etc.).
+ */
+static int
+afxdp_get_nic_numa_node(const char *ifname) {
+        char path[256];
+        FILE *f;
+        int node = AFXDP_NUMA_NODE_UNKNOWN;
+
+        snprintf(path, sizeof(path),
+                 "/sys/class/net/%s/device/numa_node", ifname);
+        f = fopen(path, "r");
+        if (f) {
+                if (fscanf(f, "%d", &node) != 1)
+                        node = AFXDP_NUMA_NODE_UNKNOWN;
+                fclose(f);
+        }
+        return node;
+}
+
+/*
+ * Bind a virtual memory range to a specific NUMA node using mbind(2).
+ * Uses MPOL_BIND | MPOL_MF_MOVE so that any pages already faulted in
+ * are migrated to the target node.
+ * Uses raw syscall to avoid introducing a libnuma dependency.
+ */
+static void
+afxdp_bind_numa(void *addr, uint64_t size, int numa_node) {
+        unsigned long nodemask = 0;
+
+        if (numa_node < 0 || numa_node >= (int)(sizeof(nodemask) * 8))
+                return;
+
+        nodemask = 1UL << numa_node;
+
+        /*
+         * mbind(addr, len, MPOL_BIND=2, nodemask, maxnode, MPOL_MF_MOVE=2)
+         * maxnode must be > the highest set bit index, so sizeof*8+1.
+         */
+        if (syscall(__NR_mbind, (long)addr, size,
+                    2L /* MPOL_BIND */,
+                    &nodemask, (unsigned long)(sizeof(nodemask) * 8 + 1),
+                    2UL /* MPOL_MF_MOVE */) != 0) {
+                AFXDP_LOG_WARN("mbind to NUMA node %d failed: %s",
+                               numa_node, strerror(errno));
+        } else {
+                AFXDP_LOG_INFO("UMEM bound to NUMA node %d", numa_node);
+        }
+}
+
+/*
+ * Allocate the UMEM packet buffer.
+ *
+ * Tries mmap(MAP_HUGETLB | MAP_HUGE_2MB) first for guaranteed
+ * 2 MiB page backing.  Falls back to posix_memalign on failure.
+ *
+ * If ifname is non-NULL and NUMA node detection succeeds, the buffer
+ * is bound to that node via mbind().
+ *
+ * Sets ctx->packet_buffer, ctx->packet_buffer_size,
+ *      ctx->packet_buffer_size_aligned, ctx->use_hugepages.
+ */
+static int
+afxdp_alloc_hugepage_buffer(struct afxdp_manager_ctx *ctx,
+                             const char *ifname) {
+        uint64_t size = AFXDP_UMEM_HUGEPAGE_ALIGNED;
+        void *buf;
+
+        buf = mmap(NULL, size,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
+                   -1, 0);
+
+        if (buf == MAP_FAILED) {
+                AFXDP_LOG_WARN("hugepage mmap failed (%s); "
+                               "falling back to posix_memalign",
+                               strerror(errno));
+                if (posix_memalign(&buf, getpagesize(), size) != 0) {
+                        AFXDP_LOG_ERR("posix_memalign fallback failed: %s",
+                                      strerror(errno));
+                        return -ENOMEM;
+                }
+                ctx->use_hugepages = false;
+        } else {
+                ctx->use_hugepages = true;
+                if (ifname) {
+                        int node = afxdp_get_nic_numa_node(ifname);
+                        if (node >= 0)
+                                afxdp_bind_numa(buf, size, node);
+                }
+        }
+
+        ctx->packet_buffer              = buf;
+        ctx->packet_buffer_size         = (uint64_t)AFXDP_NUM_FRAMES
+                                          * AFXDP_FRAME_SIZE;
+        ctx->packet_buffer_size_aligned = size;
+        return 0;
+}
+
+/*
+ * Public pre-allocation entry point — called from main() BEFORE
+ * rte_eal_init() to claim the UMEM hugepages from the kernel pool.
+ *
+ * NUMA binding is deferred: the interface name is not yet known here
+ * (it comes from AF_XDP argument parsing).  afxdp_init() will apply
+ * mbind() once the interface is resolved.
+ */
+int
+afxdp_preallocate_hugepages(struct afxdp_manager_ctx *ctx) {
+        int ret;
+
+        if (ctx->packet_buffer) {
+                AFXDP_LOG_WARN("afxdp_preallocate_hugepages called twice; "
+                               "ignoring second call");
+                return 0;
+        }
+
+        AFXDP_LOG_INFO("Pre-allocating UMEM buffer (%lu KB) "
+                       "before rte_eal_init()",
+                       AFXDP_UMEM_HUGEPAGE_ALIGNED / 1024);
+
+        ret = afxdp_alloc_hugepage_buffer(ctx, NULL /* NUMA deferred */);
+        if (ret == 0) {
+                ctx->hugepage_preallocated = true;
+                AFXDP_LOG_INFO("UMEM pre-allocation %s (%lu KB)",
+                               ctx->use_hugepages
+                                   ? "succeeded (MAP_HUGETLB)"
+                                   : "fell back to posix_memalign",
+                               ctx->packet_buffer_size_aligned / 1024);
+        }
+        return ret;
 }
 
 /****************************************************************************
@@ -765,23 +920,46 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 return -errno;
         }
 
-        /* ---- Step 5: Allocate UMEM packet buffer ---- */
-        ctx->packet_buffer_size =
-                (uint64_t)AFXDP_NUM_FRAMES * AFXDP_FRAME_SIZE;
-        if (posix_memalign(&ctx->packet_buffer, getpagesize(),
-                           ctx->packet_buffer_size)) {
-                AFXDP_LOG_ERR("posix_memalign failed: %s", strerror(errno));
-                return -ENOMEM;
+        /* ---- Step 5: Adopt pre-allocated UMEM buffer or allocate now ---- */
+        ctx->packet_buffer_size = (uint64_t)AFXDP_NUM_FRAMES * AFXDP_FRAME_SIZE;
+        if (ctx->packet_buffer) {
+                /*
+                 * Buffer was claimed before rte_eal_init() to partition the
+                 * hugepage pool.  Reuse it and apply NUMA binding now that
+                 * the interface name is known from argument parsing.
+                 */
+                if (ctx->use_hugepages) {
+                        int numa_node = afxdp_get_nic_numa_node(ctx->cfg.ifname);
+                        if (numa_node >= 0)
+                                afxdp_bind_numa(ctx->packet_buffer,
+                                                ctx->packet_buffer_size_aligned,
+                                                numa_node);
+                }
+                AFXDP_LOG_INFO("Reusing pre-allocated UMEM buffer (%s, %lu KB)",
+                               ctx->use_hugepages ? "hugepages" : "normal pages",
+                               ctx->packet_buffer_size_aligned / 1024);
+        } else {
+                /*
+                 * No pre-allocation (AF_XDP-only binary without DPDK EAL).
+                 * Allocate now with hugepages + NUMA binding.
+                 */
+                if (afxdp_alloc_hugepage_buffer(ctx, ctx->cfg.ifname) != 0) {
+                        AFXDP_LOG_ERR("UMEM buffer allocation failed");
+                        return -ENOMEM;
+                }
+                AFXDP_LOG_INFO("UMEM buffer allocated: %s, %lu KB",
+                               ctx->use_hugepages
+                                   ? "hugepages (MAP_HUGETLB)"
+                                   : "normal pages (fallback)",
+                               ctx->packet_buffer_size_aligned / 1024);
         }
-        AFXDP_LOG_INFO("UMEM buffer allocated: %lu KB",
-                       ctx->packet_buffer_size / 1024);
 
         /* ---- Step 6: Configure UMEM ---- */
         ctx->umem = afxdp_configure_umem(ctx->packet_buffer,
                                          ctx->packet_buffer_size);
         if (!ctx->umem) {
                 AFXDP_LOG_ERR("UMEM configuration failed");
-                free(ctx->packet_buffer);
+                /* Buffer freed by caller via afxdp_cleanup(ctx, true) */
                 return -ENOMEM;
         }
 
@@ -790,7 +968,9 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
         if (!ctx->xsk_socket) {
                 AFXDP_LOG_ERR("AF_XDP socket creation failed");
                 xsk_umem__delete(ctx->umem->umem);
-                free(ctx->packet_buffer);
+                free(ctx->umem);
+                ctx->umem = NULL;
+                /* Buffer freed by caller via afxdp_cleanup(ctx, true) */
                 return -ENODEV;
         }
 
@@ -847,10 +1027,14 @@ afxdp_run(struct afxdp_manager_ctx *ctx) {
 }
 
 /*
- * afxdp_cleanup() — Release all resources.
+ * afxdp_cleanup() — Release AF_XDP resources.
+ *
+ * When final_cleanup is false (mode switch), only XSK, UMEM registration,
+ * and XDP program are torn down; the hugepage buffer stays mapped.
+ * When final_cleanup is true (process exit), the buffer is also released.
  */
 void
-afxdp_cleanup(struct afxdp_manager_ctx *ctx) {
+afxdp_cleanup(struct afxdp_manager_ctx *ctx, bool final_cleanup) {
         int err;
         char errmsg[1024];
 
@@ -899,9 +1083,15 @@ afxdp_cleanup(struct afxdp_manager_ctx *ctx) {
                 ctx->umem = NULL;
         }
 
-        /* Free the raw packet buffer */
-        if (ctx->packet_buffer) {
-                free(ctx->packet_buffer);
+        /* Release packet buffer only on final process exit.
+         * In mode-switch scenarios the hugepage mapping is kept alive
+         * so it can be re-used when AF_XDP mode restarts. */
+        if (final_cleanup && ctx->packet_buffer) {
+                if (ctx->use_hugepages)
+                        munmap(ctx->packet_buffer,
+                               ctx->packet_buffer_size_aligned);
+                else
+                        free(ctx->packet_buffer);
                 ctx->packet_buffer = NULL;
         }
 
