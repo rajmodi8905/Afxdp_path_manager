@@ -483,9 +483,9 @@ afxdp_print_hugepage_status(struct afxdp_manager_ctx *ctx) {
                 }
 
                 /* MMUPageSize is the conclusive field */
-                if (strncmp(line, "MMUPageSize:", 11) == 0) {
+                if (strncmp(line, "MMUPageSize:", 12) == 0) {
                         unsigned long pg_kb = 0;
-                        sscanf(line + 11, " %lu kB", &pg_kb);
+                        sscanf(line + 12, " %lu kB", &pg_kb);
                         if (pg_kb >= 2048)
                                 printf("  VERIFIED: UMEM is backed by %lu KiB hugepages ✓\n",
                                        pg_kb);
