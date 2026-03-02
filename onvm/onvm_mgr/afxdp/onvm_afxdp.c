@@ -388,6 +388,126 @@ afxdp_preallocate_hugepages(struct afxdp_manager_ctx *ctx) {
 
 /****************************************************************************
  *
+ *             HUGEPAGE STATUS REPORTING (for testing / diagnostics)
+ *
+ *   Prints a structured summary proving whether the UMEM is actually
+ *   backed by 2 MiB hugepages at three levels:
+ *
+ *   Level 1 — mmap return value:
+ *     ctx->use_hugepages == true  → mmap(MAP_HUGETLB) returned non-MAP_FAILED
+ *
+ *   Level 2 — /proc/meminfo:
+ *     Shows the system-wide hugepage pool state (Total / Free / Reserved).
+ *     HugePages_Rsvd increases by the number of pages claimed by this mmap.
+ *
+ *   Level 3 — /proc/self/smaps:
+ *     The MMUPageSize: field for the UMEM virtual address range confirms
+ *     the kernel is using 2048 kB (2 MiB) pages for this mapping.
+ *     This is the definitive per-mapping proof.
+ *
+ ****************************************************************************/
+
+static void
+afxdp_print_hugepage_status(struct afxdp_manager_ctx *ctx) {
+        FILE *f;
+        char line[512];
+        uintptr_t buf_addr  = (uintptr_t)ctx->packet_buffer;
+        uintptr_t buf_end   = buf_addr + ctx->packet_buffer_size_aligned;
+        bool in_range       = false;
+        bool mmu_found      = false;
+
+        printf("\n");
+        printf("+---------------------------------------------------------+\n");
+        printf("|           UMEM Hugepage Status Report                   |\n");
+        printf("+---------------------------------------------------------+\n");
+        printf("  Buffer address    : %p\n", ctx->packet_buffer);
+        printf("  Buffer size       : %lu KB (%lu frames x %u B)\n",
+               ctx->packet_buffer_size_aligned / 1024,
+               (unsigned long)AFXDP_NUM_FRAMES, AFXDP_FRAME_SIZE);
+        printf("  Pre-allocated     : %s\n",
+               ctx->hugepage_preallocated ? "yes (before rte_eal_init)" : "no");
+
+        /* ---- Level 1: mmap result ---- */
+        if (ctx->use_hugepages) {
+                printf("  mmap(MAP_HUGETLB) : SUCCESS — kernel accepted hugepage request\n");
+        } else {
+                printf("  mmap(MAP_HUGETLB) : FAILED  — using 4 KiB pages (fallback)\n");
+                printf("  Hint: check /proc/meminfo HugePages_Free > 0\n");
+        }
+
+        /* ---- Level 2: /proc/meminfo ---- */
+        f = fopen("/proc/meminfo", "r");
+        if (f) {
+                printf("  /proc/meminfo     :\n");
+                while (fgets(line, sizeof(line), f)) {
+                        if (strncmp(line, "HugePages_", 10) == 0 ||
+                            strncmp(line, "Hugepagesize:", 13) == 0)
+                                printf("    %s", line);
+                }
+                fclose(f);
+        }
+
+        /* ---- Level 3: /proc/self/smaps ---- */
+        if (!ctx->use_hugepages) {
+                printf("+---------------------------------------------------------+\n\n");
+                return;
+        }
+
+        f = fopen("/proc/self/smaps", "r");
+        if (!f) {
+                printf("  /proc/self/smaps  : cannot open (%s)\n", strerror(errno));
+                printf("+---------------------------------------------------------+\n\n");
+                return;
+        }
+
+        printf("  /proc/self/smaps  :\n");
+        while (fgets(line, sizeof(line), f)) {
+                uintptr_t start = 0, end = 0;
+
+                /* Detect a new VMA header line (hex-hex perms ...) */
+                if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                        in_range = (buf_addr >= start && buf_addr < end);
+                        if (in_range)
+                                printf("    VMA: %s", line);
+                        continue;
+                }
+
+                if (!in_range)
+                        continue;
+
+                /* Print the lines that matter for hugepage verification */
+                if (strncmp(line, "MMUPageSize:",   11) == 0 ||
+                    strncmp(line, "AnonHugePages:", 14) == 0 ||
+                    strncmp(line, "Size:",           5) == 0) {
+                        printf("    %s", line);
+                }
+
+                /* MMUPageSize is the conclusive field */
+                if (strncmp(line, "MMUPageSize:", 11) == 0) {
+                        unsigned long pg_kb = 0;
+                        sscanf(line + 11, " %lu kB", &pg_kb);
+                        if (pg_kb >= 2048)
+                                printf("  VERIFIED: UMEM is backed by %lu KiB hugepages ✓\n",
+                                       pg_kb);
+                        else
+                                printf("  WARNING:  MMUPageSize is %lu KiB — not 2 MiB hugepages!\n",
+                                       pg_kb);
+                        mmu_found = true;
+                        /* Once we've found MMUPageSize for this range, stop */
+                        if (buf_end <= end)
+                                break;
+                }
+        }
+        fclose(f);
+
+        if (!mmu_found)
+                printf("  smaps: UMEM mapping not found — run as root or check /proc access\n");
+
+        printf("+---------------------------------------------------------+\n\n");
+}
+
+/****************************************************************************
+ *
  *                   UMEM MANAGEMENT (Shared Packet Buffer)
  *
  *   UMEM is a contiguous memory region registered with the kernel.
@@ -974,7 +1094,10 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 return -ENODEV;
         }
 
-        /* ---- Step 8: Start stats thread (if verbose) ---- */
+        /* ---- Step 8: Print hugepage status report ---- */
+        afxdp_print_hugepage_status(ctx);
+
+        /* ---- Step 9: Start stats thread (if verbose) ---- */
         if (ctx->cfg.verbose) {
                 err = pthread_create(&ctx->stats_thread, NULL,
                                      afxdp_stats_poll, ctx);
