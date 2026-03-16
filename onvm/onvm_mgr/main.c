@@ -54,9 +54,11 @@
  * is available BEFORE rte_eal_init() in the DPDK path.  This is the
  * mechanism that partitions the hugepage pool between the two managers.
  */
+
+#ifdef USE_AFXDP
 #include "afxdp/onvm_afxdp.h"
 
-#ifndef USE_AFXDP
+#else
 /* DPDK mode: full openNetVM manager headers */
 #include "onvm_mgr.h"
 #include "onvm_nf.h"
@@ -402,30 +404,8 @@ main(int argc, char *argv[]) {
         unsigned cur_lcore, rx_lcores, tx_lcores, wakeup_lcores;
         unsigned nfs_per_tx, nfs_per_wakeup_thread;
         unsigned i;
-        struct afxdp_manager_ctx afxdp_ctx;
 
-        /*
-         * Pre-allocate the AF_XDP UMEM hugepage region BEFORE rte_eal_init()
-         * is called inside init().  This claims the 2 MiB pages from the
-         * kernel hugepage pool early so DPDK's EAL cannot consume them.
-         *
-         * The --socket-mem EAL argument (injected by go.sh via
-         * ONVM_DPDK_SOCKET_MEM, default AFXDP_DPDK_SOCKET_MEM_MB = 1792 MB)
-         * caps DPDK's allocation to guarantee the two managers never compete
-         * for the same hugepages.
-         *
-         * If hugepages are unavailable the call silently falls back to
-         * posix_memalign and logs a warning; DPDK initialisation continues
-         * normally in that case.
-         */
-        memset(&afxdp_ctx, 0, sizeof(afxdp_ctx));
-        afxdp_preallocate_hugepages(&afxdp_ctx);
-
-        /* initialise the system (calls rte_eal_init internally) */
-        if (init(argc, argv) < 0) {
-                afxdp_cleanup(&afxdp_ctx, true);
-                return -1;
-        }
+	if(init(argc, argv) < 0) return -1;
 
         RTE_LOG(INFO, APP, "Finished Process Init.\n");
 
@@ -556,13 +536,13 @@ main(int argc, char *argv[]) {
         /* Master thread handles statistics and NF management */
         master_thread_main();
         onvm_main_free(tx_lcores,rx_lcores, tx_mgr, rx_mgr, wakeup_ctx);
-        afxdp_cleanup(&afxdp_ctx, true); /* release pre-allocated UMEM hugepage buffer */
+       // afxdp_cleanup(&afxdp_ctx, true); /* release pre-allocated UMEM hugepage buffer */
         return 0;
 
 onvm_free:
         RTE_LOG(ERR, APP, "Can't allocate required struct.\n");
         onvm_main_free(tx_lcores,rx_lcores, tx_mgr, rx_mgr, wakeup_ctx);
-        afxdp_cleanup(&afxdp_ctx, true);
+       // afxdp_cleanup(&afxdp_ctx, true);
         return -1;
 
 #endif /* USE_AFXDP */
