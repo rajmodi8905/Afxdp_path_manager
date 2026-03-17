@@ -66,6 +66,8 @@
 
 #include <sys/mman.h>    /* mmap, munmap, MAP_HUGETLB, MAP_ANONYMOUS */
 #include <sys/syscall.h> /* syscall, __NR_mbind                        */
+#include <sys/utsname.h> /* uname                                      */
+#include <dirent.h>      /* opendir, readdir, closedir                  */
 
 /* MAP_HUGE_2MB: request 2 MiB pages when combined with MAP_HUGETLB.
  * Defined in <linux/mman.h> on modern kernels; provide fallback. */
@@ -75,13 +77,18 @@
 
 /****************************Forward Declarations*****************************/
 
+static int afxdp_preflight_checks(struct afxdp_config *cfg);
 static void afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv);
 static struct afxdp_umem_info *afxdp_configure_umem(void *buffer, uint64_t size);
 static struct afxdp_socket_info *afxdp_configure_socket(struct afxdp_manager_ctx *ctx);
 static void afxdp_complete_tx(struct afxdp_socket_info *xsk);
 static void afxdp_handle_receive(struct afxdp_manager_ctx *ctx);
 static void afxdp_rx_and_process(struct afxdp_manager_ctx *ctx);
-static void *afxdp_stats_poll(void *arg);
+
+/* Worker threads */
+static void *afxdp_rx_thread_main(void *arg);
+static void *afxdp_mgr_thread_main(void *arg);
+static void *afxdp_wakeup_thread_main(void *arg);
 
 /* UMEM frame allocator */
 static uint64_t afxdp_alloc_umem_frame(struct afxdp_socket_info *xsk);
@@ -508,6 +515,178 @@ afxdp_print_hugepage_status(struct afxdp_manager_ctx *ctx) {
 
 /****************************************************************************
  *
+ *                       PRE-FLIGHT SAFETY CHECKS
+ *
+ *   Validates the system environment before any XDP/BPF kernel
+ *   interaction.  If any check fails the eBPF program is never
+ *   loaded, preventing potential kernel panics or crashes.
+ *
+ ****************************************************************************/
+
+static const char *afxdp_native_xdp_drivers[] = {
+        "i40e", "ixgbe", "ixgbevf", "mlx5_core", "mlx4_en",
+        "ice", "bnxt_en", "nfp", "qede", "ena",
+        "virtio_net", "veth", "tun", "thunderx",
+        "dpaa2-eth", "mvneta", "mvpp2", "sfc",
+        NULL
+};
+
+static int
+afxdp_preflight_checks(struct afxdp_config *cfg) {
+        char path[512];
+        char buf[256];
+        FILE *f;
+        int ret = 0;
+
+        /* 1. Interface operstate — must be "up" */
+        snprintf(path, sizeof(path),
+                 "/sys/class/net/%s/operstate", cfg->ifname);
+        f = fopen(path, "r");
+        if (!f) {
+                AFXDP_LOG_ERR("Preflight: cannot read interface state for '%s' "
+                              "(%s) — interface may not exist",
+                              cfg->ifname, strerror(errno));
+                return -ENODEV;
+        }
+        if (fgets(buf, sizeof(buf), f)) {
+                buf[strcspn(buf, "\n")] = '\0';
+                if (strcmp(buf, "up") != 0) {
+                        AFXDP_LOG_ERR("Preflight: interface '%s' is '%s', "
+                                      "must be UP before attaching XDP",
+                                      cfg->ifname, buf);
+                        fclose(f);
+                        return -ENETDOWN;
+                }
+        }
+        fclose(f);
+
+        /* 2. XDP native driver verification */
+        snprintf(path, sizeof(path),
+                 "/sys/class/net/%s/device/driver", cfg->ifname);
+        ssize_t len = readlink(path, buf, sizeof(buf) - 1);
+        if (len > 0) {
+                buf[len] = '\0';
+                const char *drv = strrchr(buf, '/');
+                drv = drv ? drv + 1 : buf;
+
+                if (cfg->attach_mode == XDP_MODE_NATIVE) {
+                        bool supported = false;
+                        for (int i = 0; afxdp_native_xdp_drivers[i]; i++) {
+                                if (strcmp(drv, afxdp_native_xdp_drivers[i]) == 0) {
+                                        supported = true;
+                                        break;
+                                }
+                        }
+                        if (!supported) {
+                                AFXDP_LOG_ERR("Preflight: driver '%s' on '%s' is not "
+                                              "known to support XDP native mode — "
+                                              "use -S for SKB (generic) mode instead",
+                                              drv, cfg->ifname);
+                                return -ENOTSUP;
+                        }
+                }
+        } else if (cfg->attach_mode == XDP_MODE_NATIVE) {
+                AFXDP_LOG_ERR("Preflight: cannot determine driver for '%s' — "
+                              "unable to verify XDP native support; "
+                              "use -S for SKB (generic) mode if unsure",
+                              cfg->ifname);
+                return -ENOTSUP;
+        }
+
+        /* 3. RX queue bounds check */
+        {
+                int queue_count = 0;
+                DIR *d;
+
+                snprintf(path, sizeof(path),
+                         "/sys/class/net/%s/queues", cfg->ifname);
+                d = opendir(path);
+                if (d) {
+                        struct dirent *ent;
+                        while ((ent = readdir(d)) != NULL) {
+                                if (strncmp(ent->d_name, "rx-", 3) == 0)
+                                        queue_count++;
+                        }
+                        closedir(d);
+                }
+
+                if (queue_count > 0 && cfg->xsk_if_queue >= queue_count) {
+                        AFXDP_LOG_ERR("Preflight: requested RX queue %d but '%s' "
+                                      "only has %d queues (valid: 0-%d)",
+                                      cfg->xsk_if_queue, cfg->ifname,
+                                      queue_count, queue_count - 1);
+                        return -EINVAL;
+                }
+        }
+
+        /* 4. XDP object file readability */
+        if (access(cfg->xdp_obj_file, R_OK) != 0) {
+                AFXDP_LOG_ERR("Preflight: XDP object file '%s' is not readable "
+                              "(%s)", cfg->xdp_obj_file, strerror(errno));
+                return -ENOENT;
+        }
+
+        /* 5. Kernel version >= 4.18 (minimum AF_XDP support) */
+        {
+                struct utsname uts;
+                int major = 0, minor = 0;
+
+                if (uname(&uts) == 0)
+                        sscanf(uts.release, "%d.%d", &major, &minor);
+
+                if (major < 4 || (major == 4 && minor < 18)) {
+                        AFXDP_LOG_ERR("Preflight: kernel %s does not support "
+                                      "AF_XDP (requires >= 4.18)", uts.release);
+                        return -ENOTSUP;
+                }
+        }
+
+        /* 6. Hugepage availability */
+        f = fopen("/proc/meminfo", "r");
+        if (f) {
+                unsigned long hp_free = 0, hp_size_kb = 0;
+                while (fgets(buf, sizeof(buf), f)) {
+                        if (sscanf(buf, "HugePages_Free: %lu", &hp_free) == 1)
+                                continue;
+                        sscanf(buf, "Hugepagesize: %lu kB", &hp_size_kb);
+                }
+                fclose(f);
+
+                if (hp_size_kb > 0) {
+                        unsigned long needed = (AFXDP_UMEM_HUGEPAGE_ALIGNED
+                                                + (hp_size_kb * 1024 - 1))
+                                               / (hp_size_kb * 1024);
+                        if (hp_free < needed) {
+                                AFXDP_LOG_WARN("Preflight: only %lu free hugepages "
+                                               "available, need %lu for UMEM — "
+                                               "will fall back to regular pages",
+                                               hp_free, needed);
+                        }
+                }
+        }
+
+        /* 7. Conflicting bind flags */
+        if ((cfg->xsk_bind_flags & XDP_ZEROCOPY) &&
+            (cfg->xsk_bind_flags & XDP_COPY)) {
+                AFXDP_LOG_ERR("Preflight: both zero-copy (-z) and copy (-c) "
+                              "modes requested — pick one");
+                return -EINVAL;
+        }
+
+        /* 8. Zero-copy requires native mode */
+        if ((cfg->xsk_bind_flags & XDP_ZEROCOPY) &&
+            cfg->attach_mode == XDP_MODE_SKB) {
+                AFXDP_LOG_ERR("Preflight: zero-copy (-z) is incompatible with "
+                              "SKB mode (-S) — use native mode (-N) for "
+                              "zero-copy, or use copy mode (-c) with SKB");
+                return -EINVAL;
+        }
+
+        return ret;
+}
+
+/****************************************************************************
+ *
  *                   UMEM MANAGEMENT (Shared Packet Buffer)
  *
  *   UMEM is a contiguous memory region registered with the kernel.
@@ -878,30 +1057,28 @@ afxdp_rx_and_process(struct afxdp_manager_ctx *ctx) {
                        ctx->cfg.xsk_poll_mode ? "poll()" : "busy-wait");
 
         while (!ctx->global_exit) {
-                /* In poll mode, block until there's data */
                 if (ctx->cfg.xsk_poll_mode) {
-                        ret = poll(fds, 1, 1000); /* 1s timeout */
+                        ret = poll(fds, 1, 1000);
                         if (ret <= 0)
                                 continue;
                 }
                 afxdp_handle_receive(ctx);
-
-                /* Check auto-shutdown conditions */
-                if (ctx->cfg.pkt_limit &&
-                    ctx->xsk_socket->stats.rx_packets >= ctx->cfg.pkt_limit) {
-                        AFXDP_LOG_INFO("Packet limit reached (%lu), shutting down",
-                                       ctx->cfg.pkt_limit);
-                        ctx->global_exit = true;
-                }
         }
 }
 
 /****************************************************************************
  *
- *                      STATISTICS THREAD
+ *                        WORKER THREADS
  *
- *   Runs in a separate pthread, periodically printing RX/TX counters
- *   and computed rates (pps, Mbps).
+ *   Three worker threads replicate the DPDK manager threading model:
+ *
+ *   1. RX thread  — polls the AF_XDP RX ring and bounces packets
+ *                   back to the NIC via the TX ring (datapath hot path).
+ *   2. Mgr thread — periodic stats display, TTL / packet-limit
+ *                   checking, and graceful shutdown coordination.
+ *   3. Wakeup thread — monitors global_exit and guarantees the
+ *                   process can respond to SIGINT/SIGTERM even
+ *                   when the RX thread is in a busy-wait loop.
  *
  ****************************************************************************/
 
@@ -924,7 +1101,6 @@ afxdp_stats_print(struct afxdp_stats_record *stats,
         if (period <= 0)
                 period = 1.0;
 
-        /* RX stats */
         packets = stats->rx_packets - prev->rx_packets;
         pps = packets / period;
         bytes = stats->rx_bytes - prev->rx_bytes;
@@ -932,7 +1108,6 @@ afxdp_stats_print(struct afxdp_stats_record *stats,
         printf(fmt, "AF_XDP RX:", stats->rx_packets, pps,
                stats->rx_bytes / 1000, bps, period);
 
-        /* TX stats */
         packets = stats->tx_packets - prev->tx_packets;
         pps = packets / period;
         bytes = stats->tx_bytes - prev->tx_bytes;
@@ -944,21 +1119,63 @@ afxdp_stats_print(struct afxdp_stats_record *stats,
 }
 
 static void *
-afxdp_stats_poll(void *arg) {
+afxdp_rx_thread_main(void *arg) {
+        struct afxdp_manager_ctx *ctx = (struct afxdp_manager_ctx *)arg;
+
+        afxdp_rx_and_process(ctx);
+        return NULL;
+}
+
+static void *
+afxdp_mgr_thread_main(void *arg) {
         struct afxdp_manager_ctx *ctx = (struct afxdp_manager_ctx *)arg;
         struct afxdp_socket_info *xsk = ctx->xsk_socket;
         struct afxdp_stats_record previous = { 0 };
         unsigned int interval = ctx->cfg.stats_interval;
+        uint64_t start_time = afxdp_gettime();
 
         setlocale(LC_NUMERIC, "en_US");
-        previous.timestamp = afxdp_gettime();
+        previous.timestamp = start_time;
 
         while (!ctx->global_exit) {
                 sleep(interval);
-                xsk->stats.timestamp = afxdp_gettime();
-                afxdp_stats_print(&xsk->stats, &previous);
-                previous = xsk->stats;
+                if (ctx->global_exit)
+                        break;
+
+                if (ctx->cfg.verbose) {
+                        xsk->stats.timestamp = afxdp_gettime();
+                        afxdp_stats_print(&xsk->stats, &previous);
+                        previous = xsk->stats;
+                }
+
+                if (ctx->cfg.time_to_live) {
+                        uint64_t elapsed_s = (afxdp_gettime() - start_time)
+                                             / 1000000000ULL;
+                        if (elapsed_s >= ctx->cfg.time_to_live) {
+                                AFXDP_LOG_INFO("TTL exceeded (%u s)",
+                                               ctx->cfg.time_to_live);
+                                ctx->global_exit = true;
+                        }
+                }
+
+                if (ctx->cfg.pkt_limit &&
+                    xsk->stats.rx_packets >= ctx->cfg.pkt_limit) {
+                        AFXDP_LOG_INFO("Packet limit reached (%lu)",
+                                       ctx->cfg.pkt_limit);
+                        ctx->global_exit = true;
+                }
         }
+        return NULL;
+}
+
+static void *
+afxdp_wakeup_thread_main(void *arg) {
+        struct afxdp_manager_ctx *ctx = (struct afxdp_manager_ctx *)arg;
+
+        while (!ctx->global_exit)
+                usleep(200000);
+
+        ctx->global_exit = true;
         return NULL;
 }
 
@@ -988,11 +1205,19 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
         /* ---- Step 1: Parse command-line arguments ---- */
         afxdp_parse_args(&ctx->cfg, argc, argv);
 
-        /* ---- Step 2: Install signal handlers ---- */
+        /* ---- Step 2: Pre-flight safety checks ---- */
+        err = afxdp_preflight_checks(&ctx->cfg);
+        if (err) {
+                AFXDP_LOG_ERR("Pre-flight checks failed — aborting before "
+                              "loading eBPF program into kernel");
+                return err;
+        }
+
+        /* ---- Step 3: Install signal handlers ---- */
         signal(SIGINT, afxdp_signal_handler);
         signal(SIGTERM, afxdp_signal_handler);
 
-        /* ---- Step 3: Load and attach the XDP kernel program ---- */
+        /* ---- Step 4: Load and attach the XDP kernel program ---- */
         AFXDP_LOG_INFO("Loading XDP program: %s (section: %s)",
                        ctx->cfg.xdp_obj_file, ctx->cfg.xdp_prog_name);
 
@@ -1033,14 +1258,14 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 AFXDP_LOG_INFO("Found xsks_map (fd=%d)", ctx->xsk_map_fd);
         }
 
-        /* ---- Step 4: Raise RLIMIT_MEMLOCK ---- */
+        /* ---- Step 5: Raise RLIMIT_MEMLOCK ---- */
         if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
                 AFXDP_LOG_ERR("setrlimit(RLIMIT_MEMLOCK) failed: %s",
                               strerror(errno));
                 return -errno;
         }
 
-        /* ---- Step 5: Adopt pre-allocated UMEM buffer or allocate now ---- */
+        /* ---- Step 6: Adopt pre-allocated UMEM buffer or allocate now ---- */
         ctx->packet_buffer_size = (uint64_t)AFXDP_NUM_FRAMES * AFXDP_FRAME_SIZE;
         if (ctx->packet_buffer) {
                 /*
@@ -1074,7 +1299,7 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                                ctx->packet_buffer_size_aligned / 1024);
         }
 
-        /* ---- Step 6: Configure UMEM ---- */
+        /* ---- Step 7: Configure UMEM ---- */
         ctx->umem = afxdp_configure_umem(ctx->packet_buffer,
                                          ctx->packet_buffer_size);
         if (!ctx->umem) {
@@ -1083,7 +1308,7 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 return -ENOMEM;
         }
 
-        /* ---- Step 7: Create AF_XDP socket ---- */
+        /* ---- Step 8: Create AF_XDP socket ---- */
         ctx->xsk_socket = afxdp_configure_socket(ctx);
         if (!ctx->xsk_socket) {
                 AFXDP_LOG_ERR("AF_XDP socket creation failed");
@@ -1094,19 +1319,10 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 return -ENODEV;
         }
 
-        /* ---- Step 8: Print hugepage status report ---- */
+        /* ---- Step 9: Print hugepage status report ---- */
         afxdp_print_hugepage_status(ctx);
 
-        /* ---- Step 9: Start stats thread (if verbose) ---- */
-        if (ctx->cfg.verbose) {
-                err = pthread_create(&ctx->stats_thread, NULL,
-                                     afxdp_stats_poll, ctx);
-                if (err) {
-                        AFXDP_LOG_ERR("Failed to create stats thread: %s",
-                                      strerror(err));
-                        /* Non-fatal: continue without stats */
-                }
-        }
+        /* Worker threads are launched in afxdp_run(). */
 
         AFXDP_LOG_INFO("========================================");
         AFXDP_LOG_INFO("  AF_XDP Manager Initialization Complete");
@@ -1116,36 +1332,61 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
 }
 
 /*
- * afxdp_run() — Enter the main polling loop.
+ * afxdp_run() — Launch worker threads, wait for them to finish.
  */
 int
 afxdp_run(struct afxdp_manager_ctx *ctx) {
-        uint64_t start_time = 0;
+        pthread_t rx_threads[AFXDP_NUM_RX_THREADS];
+        pthread_t mgr_threads[AFXDP_NUM_MGR_AUX_THREADS];
+        pthread_t wakeup_threads[AFXDP_NUM_WAKEUP_THREADS];
+        int i, err;
 
-        if (ctx->cfg.time_to_live) {
-                start_time = afxdp_gettime();
-        }
+        AFXDP_LOG_INFO("Launching worker threads: "
+                       "RX=%d  TX=%d  Mgr=%d  Wakeup=%d",
+                       AFXDP_NUM_RX_THREADS, AFXDP_NUM_TX_THREADS,
+                       AFXDP_NUM_MGR_AUX_THREADS, AFXDP_NUM_WAKEUP_THREADS);
 
-        AFXDP_LOG_INFO("Manager entering main loop...");
-
-        /* Check TTL in a wrapper around the polling loop */
-        while (!ctx->global_exit) {
-                /* Process one batch of packets */
-                afxdp_rx_and_process(ctx);
-
-                /* Check time-to-live */
-                if (ctx->cfg.time_to_live) {
-                        uint64_t elapsed_ns = afxdp_gettime() - start_time;
-                        uint64_t elapsed_s = elapsed_ns / 1000000000ULL;
-                        if (elapsed_s >= ctx->cfg.time_to_live) {
-                                AFXDP_LOG_INFO("Time to live exceeded (%u s), shutting down",
-                                               ctx->cfg.time_to_live);
-                                ctx->global_exit = true;
-                        }
+        for (i = 0; i < AFXDP_NUM_RX_THREADS; i++) {
+                err = pthread_create(&rx_threads[i], NULL,
+                                     afxdp_rx_thread_main, ctx);
+                if (err) {
+                        AFXDP_LOG_ERR("Failed to create RX thread %d: %s",
+                                      i, strerror(err));
+                        ctx->global_exit = true;
+                        return -err;
                 }
         }
 
-        AFXDP_LOG_INFO("Main loop exited");
+        for (i = 0; i < AFXDP_NUM_MGR_AUX_THREADS; i++) {
+                err = pthread_create(&mgr_threads[i], NULL,
+                                     afxdp_mgr_thread_main, ctx);
+                if (err) {
+                        AFXDP_LOG_ERR("Failed to create mgr thread %d: %s",
+                                      i, strerror(err));
+                        ctx->global_exit = true;
+                        break;
+                }
+        }
+
+        for (i = 0; i < AFXDP_NUM_WAKEUP_THREADS; i++) {
+                err = pthread_create(&wakeup_threads[i], NULL,
+                                     afxdp_wakeup_thread_main, ctx);
+                if (err) {
+                        AFXDP_LOG_ERR("Failed to create wakeup thread %d: %s",
+                                      i, strerror(err));
+                        ctx->global_exit = true;
+                        break;
+                }
+        }
+
+        for (i = 0; i < AFXDP_NUM_RX_THREADS; i++)
+                pthread_join(rx_threads[i], NULL);
+        for (i = 0; i < AFXDP_NUM_MGR_AUX_THREADS; i++)
+                pthread_join(mgr_threads[i], NULL);
+        for (i = 0; i < AFXDP_NUM_WAKEUP_THREADS; i++)
+                pthread_join(wakeup_threads[i], NULL);
+
+        AFXDP_LOG_INFO("All worker threads exited");
         return 0;
 }
 
@@ -1163,10 +1404,7 @@ afxdp_cleanup(struct afxdp_manager_ctx *ctx, bool final_cleanup) {
 
         AFXDP_LOG_INFO("Cleaning up AF_XDP resources...");
 
-        /* Wait for stats thread to finish */
-        if (ctx->cfg.verbose && ctx->stats_thread) {
-                pthread_join(ctx->stats_thread, NULL);
-        }
+        /* Worker threads are joined in afxdp_run(). */
 
         /* Print final statistics */
         if (ctx->xsk_socket) {

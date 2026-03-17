@@ -168,31 +168,24 @@ struct afxdp_socket_info {
  * Populated from command-line arguments at startup.
  */
 struct afxdp_config {
-        /* Network interface */
+        uint64_t pkt_limit;                   /* Auto-shutdown after N packets (0=off) */
+
         char ifname[IF_NAMESIZE];             /* Interface name (e.g. "eth0") */
-        int ifindex;                          /* Interface index from if_nametoindex() */
-
-        /* XDP attach mode */
-        enum xdp_attach_mode attach_mode;     /* Native, SKB (generic), or auto */
-        __u32 xdp_flags;                      /* XDP flags for socket binding */
-
-        /* Socket binding */
-        __u16 xsk_bind_flags;                 /* Copy-mode vs zero-copy flags */
-        int xsk_if_queue;                     /* RX queue index to bind to */
-        bool xsk_poll_mode;                   /* Use poll() instead of busy-wait */
-
-        /* Custom XDP program */
         char xdp_obj_file[512];               /* Path to compiled .o eBPF object */
         char xdp_prog_name[64];               /* Section/function name in the .o */
-        bool custom_xdp_prog;                 /* true if user supplied a custom .o */
 
-        /* Stats */
-        int stats_interval;                   /* Seconds between stats output */
-        bool verbose;                         /* Enable verbose logging */
-
-        /* Manager limits */
+        enum xdp_attach_mode attach_mode;     /* Native, SKB (generic), or auto */
+        __u32 xdp_flags;                      /* XDP flags for socket binding */
         uint32_t time_to_live;                /* Auto-shutdown after N seconds (0=off) */
-        uint64_t pkt_limit;                   /* Auto-shutdown after N packets (0=off) */
+        int ifindex;                          /* Interface index from if_nametoindex() */
+        int xsk_if_queue;                     /* RX queue index to bind to */
+        int stats_interval;                   /* Seconds between stats output */
+
+        __u16 xsk_bind_flags;                 /* Copy-mode vs zero-copy flags */
+
+        bool xsk_poll_mode;                   /* Use poll() instead of busy-wait */
+        bool custom_xdp_prog;                 /* true if user supplied a custom .o */
+        bool verbose;                         /* Enable verbose logging */
 };
 
 /**************************** Manager Context *********************************/
@@ -202,30 +195,22 @@ struct afxdp_config {
  * Passed to init/run/cleanup functions.
  */
 struct afxdp_manager_ctx {
-        /* Configuration */
         struct afxdp_config cfg;
 
-        /* UMEM region */
         struct afxdp_umem_info *umem;
         void *packet_buffer;                  /* Raw allocated buffer             */
+        struct afxdp_socket_info *xsk_socket;
+        struct xdp_program *xdp_prog;
+
         uint64_t packet_buffer_size;          /* logical UMEM size (frames×frame) */
         uint64_t packet_buffer_size_aligned;  /* actual mmap size (2 MiB aligned) */
-        bool     use_hugepages;               /* true → munmap; false → free()    */
-        bool     hugepage_preallocated;       /* pre-alloc'd before rte_eal_init()*/
-
-
-        /* Primary AF_XDP socket (ingress) */
-        struct afxdp_socket_info *xsk_socket;
-
-        /* XDP program handle */
-        struct xdp_program *xdp_prog;
-        int xsk_map_fd;                       /* fd of the XSKMAP in the kernel */
-
-        /* Threads */
         pthread_t stats_thread;
 
-        /* Shutdown flag */
+        int xsk_map_fd;                       /* fd of the XSKMAP in the kernel */
+
         volatile bool global_exit;
+        bool use_hugepages;                   /* true → munmap; false → free()    */
+        bool hugepage_preallocated;           /* pre-alloc'd before rte_eal_init()*/
 };
 
 #endif /* _ONVM_AFXDP_TYPES_H_ */

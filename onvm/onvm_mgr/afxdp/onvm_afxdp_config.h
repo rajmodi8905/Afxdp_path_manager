@@ -95,6 +95,26 @@
 /* Interval (in seconds) between statistics printouts */
 #define AFXDP_STATS_INTERVAL     2
 
+/**********************Threading Configuration********************************/
+
+/* Number of RX threads (one per AF_XDP socket / NIC queue). */
+#define AFXDP_NUM_RX_THREADS         1
+
+/* Number of TX threads. Zero because TX is a zero-copy bounce
+ * performed inline by the RX thread. Will increase when NF
+ * chaining with separate TX queues is added. */
+#define AFXDP_NUM_TX_THREADS         0
+
+/* Number of auxiliary management threads (stats, TTL/pkt-limit
+ * checks, graceful shutdown coordination). */
+#define AFXDP_NUM_MGR_AUX_THREADS    1
+
+/* Number of wakeup threads. Ensures the process can respond
+ * to SIGINT/SIGTERM even when the RX thread is in a tight
+ * busy-wait loop with no syscall to interrupt. Also serves
+ * as a hook for future shared-core NF wakeup support. */
+#define AFXDP_NUM_WAKEUP_THREADS     1
+
 /**********************XSKMAP Configuration***********************************/
 
 /* Maximum number of AF_XDP sockets in the XSKMAP (one per RX queue).
@@ -153,25 +173,13 @@
 /* Raw UMEM size: AFXDP_NUM_FRAMES frames of AFXDP_FRAME_SIZE each. */
 #define AFXDP_UMEM_TOTAL_BYTES       ((uint64_t)AFXDP_NUM_FRAMES * AFXDP_FRAME_SIZE)
 
-/* Actual mmap size — rounded up to the next 2 MiB boundary so the
- * allocation covers whole hugepages and does not share a page with
- * any other allocator (including DPDK). */
-#define AFXDP_UMEM_HUGEPAGE_ALIGNED \
-        (((AFXDP_UMEM_TOTAL_BYTES) + AFXDP_HUGEPAGE_SIZE - 1) \
-         & ~(AFXDP_HUGEPAGE_SIZE - 1))
+/* Actual mmap size — rounded up to the next 2 MiB boundary so the allocation covers whole hugepages and does not share a page with any other allocator (including DPDK). */
+#define AFXDP_UMEM_HUGEPAGE_ALIGNED (((AFXDP_UMEM_TOTAL_BYTES) + AFXDP_HUGEPAGE_SIZE - 1) & ~(AFXDP_HUGEPAGE_SIZE - 1))
 
-/* Maximum memory (MB per NUMA socket) that the DPDK EAL is permitted
- * to claim from the hugepage pool.  Set this via --socket-mem in
- * go.sh.  The gap between this value and the total hugepage reservation
- * (ONVM_NUM_HUGEPAGES × 2 MB, default 2048 MB) is reserved for the
- * AF_XDP UMEM region so both managers share the pool without overlap.
- *
- * Default:  2048 MB total  −  16 MB AF_XDP UMEM  =  2032 MB for DPDK.
- * We round down to 1792 MB to leave comfortable headroom. */
+/* Maximum memory (MB per NUMA socket) that the DPDK EAL is permitted to claim from the hugepage pool.*/
 #define AFXDP_DPDK_SOCKET_MEM_MB     1792
 
-/* Returned by afxdp_get_nic_numa_node() when the NIC's NUMA node
- * cannot be determined (single-socket machine or sysfs unavailable). */
+/* Returned by afxdp_get_nic_numa_node() when the NIC's NUMA node cannot be determined (single-socket machine or sysfs unavailable). */
 #define AFXDP_NUMA_NODE_UNKNOWN      (-1)
 
 #endif /* _ONVM_AFXDP_CONFIG_H_ */
