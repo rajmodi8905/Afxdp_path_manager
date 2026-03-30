@@ -59,7 +59,7 @@ LDLIBS   += -lxdp -lbpf -lelf -lz -lpthread
 
 APP       = onvm_mgr_afxdp
 
-SRCS      = main.c afxdp/onvm_afxdp.c
+SRCS      = main.c afxdp/onvm_afxdp.c afxdp/onvm_afxdp_ring.c afxdp/onvm_afxdp_chain.c afxdp/nfs/afxdp_simple_forward.c
 
 OBJS      = $(SRCS:.c=.o)
 

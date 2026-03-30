@@ -159,6 +159,68 @@
  * Each NF gets its own XSK socket in the XSKMAP. */
 #define AFXDP_MAX_NFS            64
 
+/**********************NF Chaining Constants (Phase-1 Active)*****************/
+
+/* Maximum number of NFs in a single static chain. */
+#define AFXDP_MAX_CHAIN_LENGTH       8
+
+/* Number of entries in each per-NF SPSC ring. Must be a power of 2. */
+#define AFXDP_NF_RING_SIZE           1024
+
+/* Maximum burst size when dequeue-ing from an NF ring. */
+#define AFXDP_NF_RING_BURST          64
+
+/* Total number of pre-allocated packet holders.
+ * Should be >= AFXDP_NUM_FRAMES so every in-flight UMEM frame
+ * can have a holder wrapper. */
+#define AFXDP_PKT_HOLDER_POOL_SIZE   4096
+
+/* NF action constants — set by the NF handler callback in pkt_meta.action. */
+#define AFXDP_NF_ACTION_DROP         0   /* Drop the packet                */
+#define AFXDP_NF_ACTION_NEXT         1   /* Forward to next NF in chain    */
+#define AFXDP_NF_ACTION_TONF         2   /* Send to a specific NF (by id)  */
+#define AFXDP_NF_ACTION_OUT          3   /* Transmit out of NIC (egress)   */
+
+/* Ring backend selection constants. */
+#define AFXDP_RING_BACKEND_RTE       0   /* DPDK rte_ring (future)         */
+#define AFXDP_RING_BACKEND_CUSTOM    1   /* Custom lockfree SPSC ring      */
+
+/* Default ring backend for this build. */
+#define AFXDP_DEFAULT_RING_BACKEND   AFXDP_RING_BACKEND_CUSTOM
+
+/**********************Socket Topology (Chain Mode)**************************/
+
+/* Index of the ingress XSK socket (NIC RX, chain entry). */
+#define AFXDP_INGRESS_SOCKET_IDX     0
+
+/* Index of the egress XSK socket (NIC TX, chain exit).
+ * In Phase-1 ingress and egress share the same socket. */
+#define AFXDP_EGRESS_SOCKET_IDX      0
+
+/* Number of XSK sockets used in chain mode.
+ * Phase-1: 1 (shared ingress/egress). Future: 2 (separate). */
+#define AFXDP_CHAIN_NUM_SOCKETS      1
+
+/**********************Phase-2/3 Future-Ready Parameters*********************/
+
+/* Maximum number of independent service chains. */
+#define AFXDP_MAX_SERVICE_CHAINS     16
+
+/* Maximum entries/rules per service chain. */
+#define AFXDP_MAX_CHAIN_ENTRIES      32
+
+/* Maximum dynamic NF registration/deregistration events queued. */
+#define AFXDP_MAX_DYNAMIC_NF_EVENTS  64
+
+/* Control-ring size for NF registration/deregistration queues. */
+#define AFXDP_CTRL_RING_SIZE         256
+
+/* Maximum number of NFs sharing a single core group. */
+#define AFXDP_MAX_CORE_GROUP         8
+
+/* Maximum length of a service chain name string. */
+#define AFXDP_MAX_CHAIN_NAME_LEN     64
+
 /**********************Logging Macros*****************************************/
 
 #define AFXDP_LOG_INFO(fmt, ...)  fprintf(stdout, "[AFXDP INFO] " fmt "\n", ##__VA_ARGS__)

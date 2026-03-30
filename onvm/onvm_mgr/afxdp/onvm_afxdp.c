@@ -63,6 +63,7 @@
 ******************************************************************************/
 
 #include "onvm_afxdp.h"
+#include "onvm_afxdp_chain.h"
 
 #include <sys/mman.h>    /* mmap, munmap, MAP_HUGETLB, MAP_ANONYMOUS */
 #include <sys/syscall.h> /* syscall, __NR_mbind                        */
@@ -914,53 +915,83 @@ afxdp_complete_tx(struct afxdp_socket_info *xsk) {
  *
  *                      PACKET PROCESSING
  *
- *   The manager IS the only NF. For every received packet:
- *     1. Read it from the RX ring (already done by the caller)
- *     2. Place the same UMEM descriptor on the TX ring to send it
- *        back out through the NIC — zero-copy bounce.
- *
- *   This is the simplest useful datapath: NIC → AF_XDP → NIC.
- *   No packet modification, no chaining, no steering.
- *
- *   Return true  → packet was placed on TX ring (will be sent out)
- *   Return false → TX ring was full; caller frees the frame
+ *   Two modes:
+ *     - Legacy bounce (no chain): direct RX → TX bounce.
+ *     - Chained mode: create a packet holder for each RX packet,
+ *       enqueue it to NF1's RX ring, run the chain forward loop,
+ *       and place egress packets onto the XSK TX ring.
  *
  ****************************************************************************/
 
+/*
+ * Legacy direct bounce — used only when chaining is disabled.
+ */
 static bool
 afxdp_process_packet(struct afxdp_socket_info *xsk,
                      uint64_t addr, uint32_t len) {
         uint32_t tx_idx = 0;
         int ret;
 
-        /*
-         * Reserve one slot on the TX ring.
-         * If the ring is full we cannot transmit — return false so the
-         * caller frees the UMEM frame instead of leaking it.
-         */
         ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-        if (ret != 1) {
-                /* TX ring full, drop this packet */
+        if (ret != 1)
                 return false;
-        }
 
-        /*
-         * Fill the TX descriptor with the same UMEM address and length
-         * that we received on the RX side. The packet data is already
-         * sitting in the UMEM buffer — no copy needed.
-         */
         xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
         xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len  = len;
 
-        /* Submit the descriptor to the kernel for transmission */
         xsk_ring_prod__submit(&xsk->tx, 1);
         xsk->outstanding_tx++;
 
-        /* Update TX stats */
         xsk->stats.tx_bytes += len;
         xsk->stats.tx_packets++;
 
         return true;
+}
+
+/*
+ * Submit egress holders to the XSK TX ring.
+ * Returns the number of packets actually submitted.
+ */
+static uint32_t
+afxdp_submit_egress(struct afxdp_manager_ctx *ctx,
+                    struct afxdp_pkt_holder **holders,
+                    uint32_t count) {
+        struct afxdp_socket_info *xsk = ctx->xsk_socket;
+        uint32_t tx_idx = 0;
+        uint32_t submitted = 0;
+        int ret;
+
+        if (count == 0)
+                return 0;
+
+        ret = xsk_ring_prod__reserve(&xsk->tx, count, &tx_idx);
+        if (ret <= 0)
+                return 0;
+
+        submitted = (uint32_t)ret;
+
+        for (uint32_t i = 0; i < submitted; i++) {
+                struct afxdp_pkt_holder *h = holders[i];
+                xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = h->desc.umem_addr;
+                xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len  = h->desc.len;
+                tx_idx++;
+
+                xsk->stats.tx_bytes += h->desc.len;
+                xsk->stats.tx_packets++;
+
+                /* Return holder to pool */
+                afxdp_holder_free(ctx->chain, h);
+        }
+
+        xsk_ring_prod__submit(&xsk->tx, submitted);
+        xsk->outstanding_tx += submitted;
+
+        /* Free remaining holders that didn't fit on TX ring */
+        for (uint32_t i = submitted; i < count; i++) {
+                afxdp_holder_free(ctx->chain, holders[i]);
+        }
+
+        return submitted;
 }
 
 /****************************************************************************
@@ -1013,16 +1044,69 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
         }
 
         /* Step 3: Process each received packet */
-        for (i = 0; i < rcvd; i++) {
-                uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
-                uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
+        if (ctx->chain) {
+                /*
+                 * ---- Chained mode ----
+                 * Create a pkt_holder for each RX packet and enqueue
+                 * it to the first NF's RX ring.
+                 */
+                struct afxdp_chain_ctx *chain = ctx->chain;
+                struct afxdp_nf *first_nf = &chain->nfs[chain->chain_order[0]];
 
-                if (!afxdp_process_packet(xsk, addr, len)) {
-                        /* Packet was not forwarded; return frame to pool */
-                        afxdp_free_umem_frame(xsk, addr);
+                for (i = 0; i < rcvd; i++) {
+                        uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
+                        uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
+
+                        struct afxdp_pkt_holder *holder = afxdp_holder_alloc(chain);
+                        if (!holder) {
+                                /* No free holders — drop */
+                                afxdp_free_umem_frame(xsk, addr);
+                                xsk->stats.rx_dropped++;
+                                xsk->stats.rx_bytes += len;
+                                continue;
+                        }
+
+                        /* Fill holder */
+                        holder->desc.umem_addr = addr;
+                        holder->desc.len = len;
+                        holder->meta.action = AFXDP_NF_ACTION_NEXT;
+                        holder->meta.chain_index = 0;
+                        holder->meta.destination = 0;
+                        holder->meta.flags = 0;
+
+                        /* Enqueue to first NF's RX ring */
+                        if (afxdp_ring_enqueue(first_nf->rx_ring_custom, holder) != 0) {
+                                /* First NF's ring full — drop */
+                                afxdp_holder_free(chain, holder);
+                                afxdp_free_umem_frame(xsk, addr);
+                                xsk->stats.rx_dropped++;
+                        }
+
+                        xsk->stats.rx_bytes += len;
                 }
 
-                xsk->stats.rx_bytes += len;
+                /* Run the chain forward loop */
+                struct afxdp_pkt_holder *egress[AFXDP_RX_BATCH_SIZE];
+                uint32_t egress_count = afxdp_chain_forward(
+                        chain, egress, AFXDP_RX_BATCH_SIZE);
+
+                /* Submit egress packets to XSK TX ring */
+                afxdp_submit_egress(ctx, egress, egress_count);
+
+        } else {
+                /*
+                 * ---- Legacy bounce mode (no chain) ----
+                 */
+                for (i = 0; i < rcvd; i++) {
+                        uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
+                        uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
+
+                        if (!afxdp_process_packet(xsk, addr, len)) {
+                                afxdp_free_umem_frame(xsk, addr);
+                        }
+
+                        xsk->stats.rx_bytes += len;
+                }
         }
 
         /* Step 4: Release consumed RX entries back to the kernel */
@@ -1146,6 +1230,10 @@ afxdp_mgr_thread_main(void *arg) {
                         xsk->stats.timestamp = afxdp_gettime();
                         afxdp_stats_print(&xsk->stats, &previous);
                         previous = xsk->stats;
+
+                        /* Print per-NF chain stats */
+                        if (ctx->chain)
+                                afxdp_chain_print_stats(ctx->chain);
                 }
 
                 if (ctx->cfg.time_to_live) {
@@ -1322,6 +1410,17 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
         /* ---- Step 9: Print hugepage status report ---- */
         afxdp_print_hugepage_status(ctx);
 
+        /* ---- Step 10: Initialize NF chain (2 NFs: simple_forward × 2) ---- */
+        {
+                int chain_err = afxdp_chain_init(ctx, 2);
+                if (chain_err) {
+                        AFXDP_LOG_ERR("NF chain initialization failed (err=%d)",
+                                      chain_err);
+                        /* Non-fatal: fall back to legacy bounce mode */
+                        AFXDP_LOG_WARN("Running in legacy bounce mode (no NF chain)");
+                }
+        }
+
         /* Worker threads are launched in afxdp_run(). */
 
         AFXDP_LOG_INFO("========================================");
@@ -1405,6 +1504,10 @@ afxdp_cleanup(struct afxdp_manager_ctx *ctx, bool final_cleanup) {
         AFXDP_LOG_INFO("Cleaning up AF_XDP resources...");
 
         /* Worker threads are joined in afxdp_run(). */
+
+        /* Tear down NF chain (prints final chain stats) */
+        if (ctx->chain)
+                afxdp_chain_teardown(ctx);
 
         /* Print final statistics */
         if (ctx->xsk_socket) {
