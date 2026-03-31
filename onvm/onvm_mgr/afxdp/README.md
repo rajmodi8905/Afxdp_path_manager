@@ -23,14 +23,40 @@ The AF_XDP (Address Family XDP) manager is a high-performance, zero-copy packet 
 - **Lower latency** and **reduced CPU overhead** compared to traditional kernel networking
 
 ### Key Concept
-The manager acts as a simple **packet bouncer**: packets received from the NIC via AF_XDP are immediately transmitted back to the NIC through the same UMEM region, demonstrating the basic zero-copy datapath.
+The manager supports two modes:
 
-**Architecture Flow:**
+1. **Legacy bounce mode**: packets received from the NIC via AF_XDP are immediately transmitted back — demonstrating the basic zero-copy datapath.
+2. **Chained NF mode** (default): packets flow through a chain of in-process NF handlers via lockfree SPSC rings before being transmitted back out.
+
+**Legacy Architecture Flow:**
 ```
 NIC RX → XDP Prog (eBPF) → AF_XDP RX Ring → Userspace Processing → AF_XDP TX Ring → NIC TX
          ↓                    ↓                                          ↓
     Redirect to Socket    Zero-copy UMEM                          Zero-copy UMEM
 ```
+
+**Chained NF Architecture Flow (Phase-1):**
+```
+NIC RX → XDP Prog → AF_XDP RX Ring
+  → Create afxdp_pkt_holder (UMEM desc + metadata)
+  → SPSC enqueue → NF0.rx_ring
+  → NF0 handler (simple_forward: set ACTION_NEXT)
+  → chain_forward routes → NF1.rx_ring
+  → NF1 handler (simple_forward: set ACTION_NEXT)
+  → Last NF: implicit ACTION_OUT
+  → afxdp_submit_egress → XSK TX Ring
+  → NIC TX
+```
+
+**Packet Holder Structure:**
+```c
+struct afxdp_pkt_holder {
+    struct afxdp_nf_desc  desc;   // umem_addr + len
+    struct afxdp_pkt_meta meta;   // action, chain_index, destination, flags
+};
+```
+
+**NF Actions:** `DROP` (0), `NEXT` (1), `TONF` (2), `OUT` (3)
 
 ---
 
@@ -153,14 +179,17 @@ zgrep -E 'CONFIG_BPF|CONFIG_XDP' /proc/config.gz
 
 ### Files Overview
 
-| File | Purpose | Lines | Compiled |
-|------|---------|-------|----------|
-| `af_xdp_kern.c` | XDP eBPF kernel program | 133 | Yes (BPF bytecode) |
-| `onvm_afxdp.c` | Main AF_XDP manager implementation | 909 | Yes (userspace) |
-| `onvm_afxdp.h` | Public API declarations | 127 | No (header) |
-| `onvm_afxdp_types.h` | Type definitions and includes | 227 | No (header) |
-| `onvm_afxdp_config.h` | Configuration constants | 148 | No (header) |
-| `Makefile` | Build script for XDP kernel program | 26 | No |
+| File | Purpose | Compiled |
+|------|---------|----------|
+| `af_xdp_kern.c` | XDP eBPF kernel program | Yes (BPF bytecode) |
+| `onvm_afxdp.c` | Main AF_XDP manager + chained datapath | Yes (userspace) |
+| `onvm_afxdp.h` | Public API declarations | No (header) |
+| `onvm_afxdp_types.h` | Type definitions (UMEM, sockets, NF chain types) | No (header) |
+| `onvm_afxdp_config.h` | Config constants (ring sizes, NF actions, chain params) | No (header) |
+| `onvm_afxdp_ring.h/c` | Lockfree SPSC ring (rte_ring-compatible API) | Yes (userspace) |
+| `onvm_afxdp_chain.h/c` | NF chain management (init, forward, teardown) | Yes (userspace) |
+| `nfs/afxdp_simple_forward.h/c` | Simple forward NF (pass-through, sets ACTION_NEXT) | Yes (userspace) |
+| `Makefile` | Build script for XDP kernel program | No |
 
 ### Workflow by File
 
@@ -910,7 +939,255 @@ sudo ./onvm_mgr_afxdp -d eth0 -f my_custom_xdp.o -P my_prog_section
 
 ---
 
+### Example 9: NF Chain Mode (Default — 2-NF Chain)
+```bash
+sudo ./onvm_mgr_afxdp -d eth0 -S -v
+```
+- Starts with a 2-NF chain (`simple_forward` × 2) by default
+- Each NF sets `ACTION_NEXT` → packet walks: NF0 → NF1 → egress TX
+- Verbose mode shows per-NF statistics every 2 seconds
+
+**Expected Initialization Output:**
+```
+[AFXDP INFO] SPSC ring 'nf0_rx' created: 2048 slots (2047 usable)
+[AFXDP INFO] SPSC ring 'nf0_tx' created: 2048 slots (2047 usable)
+[AFXDP INFO] Chain: NF 0 initialized (simple_forward)
+[AFXDP INFO] SPSC ring 'nf1_rx' created: 2048 slots (2047 usable)
+[AFXDP INFO] SPSC ring 'nf1_tx' created: 2048 slots (2047 usable)
+[AFXDP INFO] Chain: NF 1 initialized (simple_forward)
+[AFXDP INFO] ========================================
+[AFXDP INFO]   NF Chain Initialized: 2 NFs
+[AFXDP INFO]   Ring backend: CUSTOM SPSC
+[AFXDP INFO]   Ring size: 1024  Burst: 64
+[AFXDP INFO] ========================================
+```
+
+**Expected Per-Interval Stats (with traffic):**
+```
+AF_XDP RX:      5,000 pkts (  2,500 pps)       320 Kbytes (  1280 Kbits/s) period:2.000000
+       TX:      5,000 pkts (  2,500 pps)       320 Kbytes (  1280 Kbits/s) period:2.000000
+
+--- NF Chain Statistics ---
+  NF 0: RX 5000 pkts (320000 B)  TX 5000 pkts (320000 B)  Dropped 0
+  NF 1: RX 5000 pkts (320000 B)  TX 5000 pkts (320000 B)  Dropped 0
+---
+```
+
+**Expected Final Stats (Ctrl+C):**
+```
+[AFXDP INFO] Tearing down NF chain...
+
+--- NF Chain Statistics ---
+  NF 0: RX 50000 pkts (3200000 B)  TX 50000 pkts (3200000 B)  Dropped 0
+  NF 1: RX 50000 pkts (3200000 B)  TX 50000 pkts (3200000 B)  Dropped 0
+---
+
+--- Final Statistics ---
+RX: 50000 packets, 3200000 bytes
+TX: 50000 packets, 3200000 bytes
+[AFXDP INFO] NF chain teardown complete
+```
+
+---
+
 ## Testing Methods
+
+### 0. NF Chain Verification (Phase-1)
+
+These tests validate that the NF chaining infrastructure works correctly: packets enter the chain, pass through all NFs, and exit to the NIC with matching counters.
+
+#### Prerequisites
+```bash
+# Build the project
+cd onvm/onvm_mgr
+make clean && make MODE=AFXDP
+
+# Verify binary includes chain support
+./onvm_mgr_afxdp -h
+```
+
+#### Test A: Chain Initialization (No Traffic)
+
+**Purpose:** Verify that the 2-NF chain initializes correctly without any traffic.
+
+```bash
+# Start manager and immediately Ctrl+C
+sudo timeout 3 ./onvm_mgr_afxdp -d eth0 -S -v || true
+```
+
+**✅ Pass if output contains ALL of:**
+- `NF Chain Initialized: 2 NFs`
+- `Ring backend: CUSTOM SPSC`
+- `Chain: NF 0 initialized (simple_forward)`
+- `Chain: NF 1 initialized (simple_forward)`
+- `SPSC ring 'nf0_rx' created`
+- `SPSC ring 'nf1_rx' created`
+- `NF chain teardown complete` (on exit)
+
+**❌ Fail if output contains:**
+- `NF chain initialization failed`
+- `Running in legacy bounce mode`
+- Any segfault or abort
+
+---
+
+#### Test B: Packet Counters Match Through Chain (With Traffic)
+
+**Purpose:** Verify that every received packet passes through both NFs with zero drops.
+
+**Setup:** Two machines or two interfaces on the same machine.
+
+```bash
+# Terminal 1 (receiver): Start manager in verbose mode
+sudo ./onvm_mgr_afxdp -d eth0 -S -v -l 10000
+```
+
+```bash
+# Terminal 2 (sender): Generate exactly 10,000 packets
+sudo ping -f -c 10000 <receiver_ip>
+# Or:
+sudo mausezahn eth0 -c 10000 -t udp "dp=5000" -A <src_ip> -B <dst_ip>
+```
+
+**✅ Pass if ALL conditions are met:**
+
+| Counter | Expected Value | How to Check |
+|---------|---------------|---------------|
+| XSK RX packets | ~10,000 | `Final Statistics → RX` |
+| XSK TX packets | ~10,000 *(same as RX)* | `Final Statistics → TX` |
+| NF 0 RX packets | == XSK RX | `NF Chain Statistics → NF 0 RX` |
+| NF 0 TX packets | == NF 0 RX | `NF Chain Statistics → NF 0 TX` |
+| NF 1 RX packets | == NF 0 TX | `NF Chain Statistics → NF 1 RX` |
+| NF 1 TX packets | == NF 1 RX | `NF Chain Statistics → NF 1 TX` |
+| NF 0 Dropped | 0 | `NF Chain Statistics → NF 0 Dropped` |
+| NF 1 Dropped | 0 | `NF Chain Statistics → NF 1 Dropped` |
+
+**Key invariant:** `XSK RX == NF0 RX == NF0 TX == NF1 RX == NF1 TX == XSK TX`
+
+---
+
+#### Test C: Chain Graceful Fallback
+
+**Purpose:** Verify that if chain init fails, the manager falls back to legacy bounce mode.
+
+This can be tested by temporarily modifying `afxdp_chain_init()` to return `-1`, rebuilding, and running:
+
+```bash
+sudo ./onvm_mgr_afxdp -d eth0 -S -v -t 5
+```
+
+**✅ Pass if output contains:**
+- `NF chain initialization failed`
+- `Running in legacy bounce mode`
+- Manager continues running (does not crash)
+- RX and TX counters still increment (bounce mode works)
+
+---
+
+#### Test D: UMEM Integrity Under Sustained Load
+
+**Purpose:** Verify no UMEM frame leaks over extended traffic.
+
+```bash
+# Run for 60 seconds under sustained traffic
+sudo ./onvm_mgr_afxdp -d eth0 -S -v -t 60
+```
+
+```bash
+# In another terminal: sustained flood
+sudo ping -f <receiver_ip>
+# Run for the full 60 seconds
+```
+
+**✅ Pass if:**
+- Manager does not crash or hang
+- Final `NF 0 Dropped` and `NF 1 Dropped` remain 0 (or very low)
+- `XSK RX ≈ XSK TX` (within 1-2% due to timing)
+- No `holder pool exhausted` warnings in output
+
+---
+
+#### Test E: Chain Stats Printing
+
+**Purpose:** Verify that verbose mode prints per-NF stats alongside XSK stats.
+
+```bash
+sudo ./onvm_mgr_afxdp -d eth0 -S -v -t 10
+```
+
+```bash
+# Generate continuous traffic
+sudo ping -f <receiver_ip>
+```
+
+**✅ Pass if:**
+- Per-NF stats (`--- NF Chain Statistics ---`) print every ~2 seconds
+- NF counters increment between intervals
+- Both NF 0 and NF 1 show non-zero RX/TX after traffic starts
+- Stats format matches: `NF <id>: RX <n> pkts (<n> B) TX <n> pkts (<n> B) Dropped <n>`
+
+---
+
+#### Automated NF Chain Test Script
+```bash
+#!/bin/bash
+# test_nf_chain.sh — Validates NF chaining functionality
+
+set -e
+IFACE="${1:-eth0}"
+MGR="./onvm_mgr_afxdp"
+
+echo "=== AF_XDP NF Chain Tests ==="
+echo "Interface: $IFACE"
+echo ""
+
+# Test A: Chain initialization
+echo "Test A: Chain initialization (3s timeout)..."
+OUT=$(sudo timeout 3 $MGR -d $IFACE -S -v 2>&1 || true)
+if echo "$OUT" | grep -q "NF Chain Initialized: 2 NFs"; then
+    echo "  ✅ Chain initialized with 2 NFs"
+else
+    echo "  ❌ Chain initialization failed"
+    echo "$OUT"
+    exit 1
+fi
+
+if echo "$OUT" | grep -q "NF chain teardown complete"; then
+    echo "  ✅ Chain teardown clean"
+else
+    echo "  ⚠️  Chain teardown message not found (may be normal with timeout)"
+fi
+
+# Test B: Rings created
+for i in 0 1; do
+    if echo "$OUT" | grep -q "SPSC ring 'nf${i}_rx' created"; then
+        echo "  ✅ NF ${i} RX ring created"
+    else
+        echo "  ❌ NF ${i} RX ring missing"
+        exit 1
+    fi
+done
+
+# Test C: Ring backend
+if echo "$OUT" | grep -q "Ring backend: CUSTOM SPSC"; then
+    echo "  ✅ Custom SPSC backend active"
+else
+    echo "  ❌ Unexpected ring backend"
+    exit 1
+fi
+
+echo ""
+echo "=== All NF Chain Tests Passed ==="
+echo "Note: Run Test B (counter matching) manually with traffic."
+```
+
+**Usage:**
+```bash
+chmod +x test_nf_chain.sh
+sudo ./test_nf_chain.sh eth0
+```
+
+---
 
 ### 1. Functional Testing
 
