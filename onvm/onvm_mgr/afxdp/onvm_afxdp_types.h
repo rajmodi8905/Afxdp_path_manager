@@ -327,6 +327,9 @@ struct afxdp_chain_ctx {
 
         /* Selected ring backend */
         enum afxdp_ring_backend ring_backend;
+
+        /* Back-reference to XSK socket for UMEM frame reclamation on drop */
+        struct afxdp_socket_info *xsk;
 };
 
 /**************************** Manager Context *********************************/

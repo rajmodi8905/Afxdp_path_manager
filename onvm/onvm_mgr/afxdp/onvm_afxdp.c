@@ -93,7 +93,7 @@ static void *afxdp_wakeup_thread_main(void *arg);
 
 /* UMEM frame allocator */
 static uint64_t afxdp_alloc_umem_frame(struct afxdp_socket_info *xsk);
-static void afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame);
+void afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame);
 static uint64_t afxdp_umem_free_frames(struct afxdp_socket_info *xsk);
 
 /* Packet processing callback (called for each received packet) */
@@ -746,7 +746,7 @@ afxdp_alloc_umem_frame(struct afxdp_socket_info *xsk) {
 /*
  * Return a UMEM frame to the free-list.
  */
-static void
+void
 afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame) {
         assert(xsk->umem_frame_free < AFXDP_NUM_FRAMES);
         xsk->umem_frame_addr[xsk->umem_frame_free++] = frame;
@@ -1034,7 +1034,7 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
                 /* Retry until we get all the slots we asked for */
                 while (ret != (int)stock_frames) {
                         ret = xsk_ring_prod__reserve(&xsk->umem->fq,
-                                                     rcvd, &idx_fq);
+                                                     stock_frames, &idx_fq);
                 }
                 for (i = 0; i < stock_frames; i++) {
                         *xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =

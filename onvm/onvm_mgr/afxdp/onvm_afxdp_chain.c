@@ -97,6 +97,7 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
 
         chain->chain_length = num_nfs;
         chain->ring_backend = AFXDP_DEFAULT_RING_BACKEND;
+        chain->xsk = ctx->xsk_socket;
 
         /* ---- Allocate packet holder pool ---- */
         chain->holder_pool_size = AFXDP_PKT_HOLDER_POOL_SIZE;
@@ -250,6 +251,7 @@ afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
                                                        pkt) != 0) {
                                         /* Next NF's ring is full — drop */
                                         nf->stats.dropped++;
+                                        afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                         afxdp_holder_free(chain, pkt);
                                 }
                         } else {
@@ -258,6 +260,7 @@ afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
                                         egress_holders[egress_count++] = pkt;
                                 } else {
                                         nf->stats.dropped++;
+                                        afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                         afxdp_holder_free(chain, pkt);
                                 }
                         }
@@ -272,6 +275,7 @@ afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
                                 egress_holders[egress_count++] = pkt;
                         } else {
                                 nf->stats.dropped++;
+                                afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                 afxdp_holder_free(chain, pkt);
                         }
                         nf->stats.tx_packets++;
@@ -287,10 +291,12 @@ afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
                                         chain->nfs[dest].rx_ring_custom,
                                         pkt) != 0) {
                                         nf->stats.dropped++;
+                                        afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                         afxdp_holder_free(chain, pkt);
                                 }
                         } else {
                                 nf->stats.dropped++;
+                                afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                 afxdp_holder_free(chain, pkt);
                         }
                         nf->stats.tx_packets++;
@@ -302,6 +308,7 @@ afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
                 default:
                         /* Drop packet */
                         nf->stats.dropped++;
+                        afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                         afxdp_holder_free(chain, pkt);
                         break;
                 }

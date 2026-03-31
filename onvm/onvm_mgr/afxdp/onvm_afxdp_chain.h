@@ -72,6 +72,14 @@ void
 afxdp_holder_free(struct afxdp_chain_ctx *chain,
                   struct afxdp_pkt_holder *holder);
 
+/**
+ * Return a UMEM frame to the socket free-list.
+ * Defined in onvm_afxdp.c; declared here so the chain module
+ * can reclaim UMEM frames when dropping packets.
+ */
+void
+afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame);
+
 /******************************** Chain API ************************************/
 
 /**
