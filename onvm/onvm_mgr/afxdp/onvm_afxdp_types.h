@@ -308,8 +308,8 @@ struct afxdp_service_chain {
  * Owned by the manager context.
  */
 struct afxdp_chain_ctx {
-        /* NF table (indexed by nf_id) */
-        struct afxdp_nf nfs[AFXDP_MAX_CHAIN_LENGTH];
+        /* NF table (indexed by nf_id, supports up to AFXDP_MAX_NFS) */
+        struct afxdp_nf nfs[AFXDP_MAX_NFS];
 
         /* Static chain order — nf_ids in execution sequence */
         uint16_t chain_order[AFXDP_MAX_CHAIN_LENGTH];

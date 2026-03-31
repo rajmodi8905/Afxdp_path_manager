@@ -202,25 +202,17 @@ fail_rings:
 /******************************* Chain Forward ********************************/
 
 /*
- * Process one NF: dequeue from its RX ring, call handler, route output.
- *
- * Packets with ACTION_NEXT go to the next NF's RX ring.
- * Packets with ACTION_OUT are collected for egress.
- * Packets with ACTION_DROP are freed back to the holder pool.
- * Packets with ACTION_TONF go to the specified destination NF's RX ring.
+ * RX side of one NF: dequeue from its RX ring, call handler, enqueue
+ * processed packets to the NF's own TX ring.
  */
-static uint32_t
-afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
-                       uint16_t nf_idx,
-                       struct afxdp_pkt_holder **egress_holders,
-                       uint32_t max_egress,
-                       uint32_t egress_count) {
+static void
+afxdp_chain_rx_nf(struct afxdp_chain_ctx *chain, uint16_t nf_idx) {
         struct afxdp_nf *nf = &chain->nfs[nf_idx];
         struct afxdp_pkt_holder *batch[AFXDP_NF_RING_BURST];
         uint32_t dequeued, i;
 
         if (!nf->active || !nf->rx_ring_custom)
-                return egress_count;
+                return;
 
         /* Dequeue burst from NF's RX ring */
         dequeued = afxdp_ring_dequeue_burst(
@@ -238,6 +230,44 @@ afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
                         nf->handler(pkt, nf);
                 }
 
+                /* Enqueue to NF's own TX ring */
+                if (afxdp_ring_enqueue(nf->tx_ring_custom, pkt) != 0) {
+                        /* TX ring full — drop */
+                        nf->stats.dropped++;
+                        afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
+                        afxdp_holder_free(chain, pkt);
+                }
+        }
+}
+
+/*
+ * TX side of one NF: dequeue from its TX ring, route based on action.
+ *
+ * Packets with ACTION_NEXT go to the next NF's RX ring.
+ * Packets with ACTION_OUT are collected for egress.
+ * Packets with ACTION_DROP are freed back to the holder pool.
+ * Packets with ACTION_TONF go to the specified destination NF's RX ring.
+ */
+static uint32_t
+afxdp_chain_tx_nf(struct afxdp_chain_ctx *chain,
+                  uint16_t nf_idx,
+                  struct afxdp_pkt_holder **egress_holders,
+                  uint32_t max_egress,
+                  uint32_t egress_count) {
+        struct afxdp_nf *nf = &chain->nfs[nf_idx];
+        struct afxdp_pkt_holder *batch[AFXDP_NF_RING_BURST];
+        uint32_t dequeued, i;
+
+        if (!nf->active || !nf->tx_ring_custom)
+                return egress_count;
+
+        /* Dequeue burst from NF's TX ring */
+        dequeued = afxdp_ring_dequeue_burst(
+                nf->tx_ring_custom, (void **)batch, AFXDP_NF_RING_BURST);
+
+        for (i = 0; i < dequeued; i++) {
+                struct afxdp_pkt_holder *pkt = batch[i];
+
                 /* Route based on action */
                 switch (pkt->meta.action) {
                 case AFXDP_NF_ACTION_NEXT: {
@@ -249,23 +279,25 @@ afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
                                 pkt->meta.chain_index = next_pos;
                                 if (afxdp_ring_enqueue(next_nf->rx_ring_custom,
                                                        pkt) != 0) {
-                                        /* Next NF's ring is full — drop */
                                         nf->stats.dropped++;
                                         afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                         afxdp_holder_free(chain, pkt);
+                                } else {
+                                        nf->stats.tx_packets++;
+                                        nf->stats.tx_bytes += pkt->desc.len;
                                 }
                         } else {
                                 /* Last NF in chain — treat as OUT */
                                 if (egress_count < max_egress) {
                                         egress_holders[egress_count++] = pkt;
+                                        nf->stats.tx_packets++;
+                                        nf->stats.tx_bytes += pkt->desc.len;
                                 } else {
                                         nf->stats.dropped++;
                                         afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                         afxdp_holder_free(chain, pkt);
                                 }
                         }
-                        nf->stats.tx_packets++;
-                        nf->stats.tx_bytes += pkt->desc.len;
                         break;
                 }
 
@@ -273,13 +305,13 @@ afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
                         /* Send to NIC egress */
                         if (egress_count < max_egress) {
                                 egress_holders[egress_count++] = pkt;
+                                nf->stats.tx_packets++;
+                                nf->stats.tx_bytes += pkt->desc.len;
                         } else {
                                 nf->stats.dropped++;
                                 afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                 afxdp_holder_free(chain, pkt);
                         }
-                        nf->stats.tx_packets++;
-                        nf->stats.tx_bytes += pkt->desc.len;
                         break;
 
                 case AFXDP_NF_ACTION_TONF: {
@@ -293,14 +325,15 @@ afxdp_chain_process_nf(struct afxdp_chain_ctx *chain,
                                         nf->stats.dropped++;
                                         afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                         afxdp_holder_free(chain, pkt);
+                                } else {
+                                        nf->stats.tx_packets++;
+                                        nf->stats.tx_bytes += pkt->desc.len;
                                 }
                         } else {
                                 nf->stats.dropped++;
                                 afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                                 afxdp_holder_free(chain, pkt);
                         }
-                        nf->stats.tx_packets++;
-                        nf->stats.tx_bytes += pkt->desc.len;
                         break;
                 }
 
@@ -322,13 +355,35 @@ afxdp_chain_forward(struct afxdp_chain_ctx *chain,
                     struct afxdp_pkt_holder **egress_holders,
                     uint32_t max_egress) {
         uint32_t egress_count = 0;
-        uint16_t i;
+        uint16_t i, pass;
+        bool pending;
 
-        for (i = 0; i < chain->chain_length; i++) {
-                uint16_t nf_id = chain->chain_order[i];
-                egress_count = afxdp_chain_process_nf(
-                        chain, nf_id, egress_holders,
-                        max_egress, egress_count);
+        for (pass = 0; pass < chain->chain_length; pass++) {
+                /* RX side: run each NF handler, enqueue to TX ring */
+                for (i = 0; i < chain->chain_length; i++) {
+                        afxdp_chain_rx_nf(chain, chain->chain_order[i]);
+                }
+
+                /* TX side: drain each NF's TX ring, route by action */
+                for (i = 0; i < chain->chain_length; i++) {
+                        egress_count = afxdp_chain_tx_nf(
+                                chain, chain->chain_order[i], egress_holders,
+                                max_egress, egress_count);
+                }
+
+                /* Check if any NF has pending RX work from cross-NF routing */
+                pending = false;
+                for (i = 0; i < chain->chain_length; i++) {
+                        uint16_t nf_id = chain->chain_order[i];
+                        if (chain->nfs[nf_id].active &&
+                            chain->nfs[nf_id].rx_ring_custom &&
+                            afxdp_ring_count(chain->nfs[nf_id].rx_ring_custom) > 0) {
+                                pending = true;
+                                break;
+                        }
+                }
+                if (!pending)
+                        break;
         }
 
         return egress_count;
@@ -371,14 +426,35 @@ afxdp_chain_teardown(struct afxdp_manager_ctx *ctx) {
         /* Print final chain stats */
         afxdp_chain_print_stats(chain);
 
-        /* Free per-NF rings */
+        /* Drain and free per-NF rings */
         for (i = 0; i < chain->chain_length; i++) {
                 struct afxdp_nf *nf = &chain->nfs[i];
+                struct afxdp_pkt_holder *holder;
+
+                /* Drain RX ring — reclaim UMEM frames */
                 if (nf->rx_ring_custom) {
+                        while (afxdp_ring_dequeue_burst(
+                                       nf->rx_ring_custom,
+                                       (void **)&holder, 1) > 0) {
+                                if (chain->xsk)
+                                        afxdp_free_umem_frame(chain->xsk,
+                                                              holder->desc.umem_addr);
+                                afxdp_holder_free(chain, holder);
+                        }
                         afxdp_ring_free(nf->rx_ring_custom);
                         nf->rx_ring_custom = NULL;
                 }
+
+                /* Drain TX ring — reclaim UMEM frames */
                 if (nf->tx_ring_custom) {
+                        while (afxdp_ring_dequeue_burst(
+                                       nf->tx_ring_custom,
+                                       (void **)&holder, 1) > 0) {
+                                if (chain->xsk)
+                                        afxdp_free_umem_frame(chain->xsk,
+                                                              holder->desc.umem_addr);
+                                afxdp_holder_free(chain, holder);
+                        }
                         afxdp_ring_free(nf->tx_ring_custom);
                         nf->tx_ring_custom = NULL;
                 }

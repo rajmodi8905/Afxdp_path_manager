@@ -64,6 +64,8 @@
  */
 static inline uint32_t
 ring_align_pow2(uint32_t v) {
+        if (v == 0)
+                return 1;
         v--;
         v |= v >> 1;
         v |= v >> 2;
