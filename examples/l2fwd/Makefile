@@ -52,7 +52,7 @@ SRCS-y := l2fwd.c
 # OpenNetVM path
 ONVM= $(SRCDIR)/../../onvm
 
-CFLAGS += -O3 $(USER_FLAGS)
+CFLAGS += -O3 -fcommon $(USER_FLAGS)
 
 CFLAGS += -I$(ONVM)/onvm_nflib
 CFLAGS += -I$(ONVM)/lib

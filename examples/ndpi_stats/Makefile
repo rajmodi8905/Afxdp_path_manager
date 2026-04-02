@@ -57,7 +57,7 @@ SRCS-y := ndpi_stats.c ndpi_util.c
 # OpenNetVM path
 ONVM= $(SRCDIR)/../../onvm
 
-CFLAGS += -O3 $(USER_FLAGS)
+CFLAGS += -O3 -fcommon $(USER_FLAGS)
 
 CFLAGS += -I$(NDPI_HOME)/src/include
 LDFLAGS += $(NDPI_HOME)/lib/libndpi.a

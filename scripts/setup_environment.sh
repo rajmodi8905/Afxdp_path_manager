@@ -85,16 +85,14 @@ fi
 # Verify sudo access
 sudo -v
 
-# Load uio kernel modules
-grep -m 1 "igb_uio" /proc/modules | cat
+# Load vfio-pci kernel module (replaces igb_uio for modern kernels)
+grep -m 1 "vfio_pci" /proc/modules | cat
 if [ "${PIPESTATUS[0]}" != 0 ]; then
-    echo "Loading uio kernel modules"
+    echo "Loading vfio-pci kernel module"
     sleep 1
-    cd "$RTE_SDK"/"$RTE_TARGET"/kmod
-    sudo modprobe uio
-    sudo insmod igb_uio.ko
+    sudo modprobe vfio-pci
 else
-    echo "IGB UIO module already loaded."
+    echo "vfio-pci module already loaded."
 fi
 
 # dpdk_nic_bind.py has been changed to dpdk-devbind.py to be compatible with DPDK 16.11
@@ -104,12 +102,12 @@ $DPDK_DEVBIND --status
 
 echo "Binding NIC status"
 if [ -z "$ONVM_NIC_PCI" ];then
-    for id in $($DPDK_DEVBIND --status | grep -v Active | grep -e "10G" -e "10-Gigabit" | grep unused=igb_uio | cut -f 1 -d " ")
+    for id in $($DPDK_DEVBIND --status | grep -v Active | grep -e "10G" -e "10-Gigabit" | grep unused=vfio-pci | cut -f 1 -d " ")
     do
         read -r -p "Bind interface $id to DPDK? [y/N] " response
         if [[ $response =~ ^([yY][eE][sS]|[yY])$ ]];then
             echo "Binding $id to dpdk"
-            sudo "$DPDK_DEVBIND" -b igb_uio "$id"
+            sudo "$DPDK_DEVBIND" -b vfio-pci "$id"
         fi
     done
 else
@@ -117,7 +115,7 @@ else
     for nic_id in $ONVM_NIC_PCI
     do
         echo "Binding $nic_id to DPDK"
-        sudo "$DPDK_DEVBIND" -b igb_uio "$nic_id"
+        sudo "$DPDK_DEVBIND" -b vfio-pci "$nic_id"
     done
 fi
 

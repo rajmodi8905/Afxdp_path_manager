@@ -103,12 +103,12 @@ else
     sed -i -e 's/O_TO_EXE_STR =/\$(shell if [ \! -d \${RTE_SDK}\/\${RTE_TARGET}\/lib ]\; then mkdir -p \${RTE_SDK}\/\${RTE_TARGET}\/lib\; fi)\nLINKER_FLAGS = \$(call linkerprefix,\$(LDLIBS))\n\$(shell echo \${LINKER_FLAGS} \> \${RTE_SDK}\/\${RTE_TARGET}\/lib\/ldflags\.txt)\nO_TO_EXE_STR =/g' "$RTE_SDK"/mk/rte.app.mk
 fi
 
-sed -i 's/CONFIG_RTE_EAL_IGB_UIO=n/CONFIG_RTE_EAL_IGB_UIO=y/g' "$RTE_SDK"/config/common_base
+# Disabled: igb_uio is incompatible with modern kernels (>=5.x), use vfio-pci instead
+sed -i 's/CONFIG_RTE_EAL_IGB_UIO=y/CONFIG_RTE_EAL_IGB_UIO=n/g' "$RTE_SDK"/config/common_base
 
 sleep 1
 make config T="$RTE_TARGET"
-make T="$RTE_TARGET" -j 8
-make install T="$RTE_TARGET" -j 8
+make T="$RTE_TARGET" -j 8 RTE_DEVEL_BUILD=n EXTRA_CFLAGS='-Wno-format-truncation'
 
 # Refresh sudo
 sudo -v

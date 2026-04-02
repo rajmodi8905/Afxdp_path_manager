@@ -274,7 +274,7 @@ aes_encrypt_cbc(const BYTE in[], size_t in_len, BYTE out[], const WORD key[], in
 
 int
 aes_encrypt_cbc_mac(const BYTE in[], size_t in_len, BYTE out[], const WORD key[], int keysize, const BYTE iv[]) {
-        BYTE buf_in[AES_BLOCK_SIZE], buf_out[AES_BLOCK_SIZE], iv_buf[AES_BLOCK_SIZE];
+        BYTE buf_in[AES_BLOCK_SIZE], buf_out[AES_BLOCK_SIZE] = {0}, iv_buf[AES_BLOCK_SIZE];
         int blocks, idx;
 
         if (in_len % AES_BLOCK_SIZE != 0)

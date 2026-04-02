@@ -56,7 +56,7 @@ NFD= $(SRCDIR)/..
 
 CC=g++
 
-CPPFLAGS = -O3 $(USER_FLAGS) -lpcap -std=c++11 -march=native
+CPPFLAGS = -O3 -fcommon $(USER_FLAGS) -lpcap -std=c++11 -march=native
 CPPFLAGS += -I$(ONVM)/onvm_nflib
 CPPFLAGS += -I$(ONVM)/lib
 CPPFLAGS += -I$(DPDK)/build/include
