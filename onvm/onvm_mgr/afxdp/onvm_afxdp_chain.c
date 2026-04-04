@@ -57,6 +57,10 @@
 #include <string.h>
 #include <inttypes.h>
 
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+#include <rte_ring.h>
+#endif
+
 /******************************* Holder Pool **********************************/
 
 struct afxdp_pkt_holder *
@@ -138,40 +142,65 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
                 nf->chain_position = i;
                 nf->active = true;
 
-                /* rte_ring pointers are NULL in Phase-1 */
-                nf->rx_ring = NULL;
-                nf->tx_ring = NULL;
+                if (chain->ring_backend == AFXDP_RING_BE_RTE) {
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+                        /* Create DPDK rte_ring RX */
+                        snprintf(ring_name, sizeof(ring_name), "afxdp_nf%u_rx", i);
+                        nf->rx_ring = rte_ring_create(ring_name,
+                                        AFXDP_NF_RING_SIZE,
+                                        rte_socket_id(),
+                                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+                        if (!nf->rx_ring) {
+                                AFXDP_LOG_ERR("Chain init: rte_ring_create RX failed for NF %u", i);
+                                goto fail_rings;
+                        }
 
-                /* Create custom SPSC RX ring */
-                snprintf(ring_name, sizeof(ring_name), "nf%u_rx", i);
-                nf->rx_ring_custom = afxdp_ring_create(ring_name,
-                                                        AFXDP_NF_RING_SIZE);
-                if (!nf->rx_ring_custom) {
-                        AFXDP_LOG_ERR("Chain init: failed to create RX ring for NF %u", i);
-                        goto fail_rings;
-                }
+                        /* Create DPDK rte_ring TX */
+                        snprintf(ring_name, sizeof(ring_name), "afxdp_nf%u_tx", i);
+                        nf->tx_ring = rte_ring_create(ring_name,
+                                        AFXDP_NF_RING_SIZE,
+                                        rte_socket_id(),
+                                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+                        if (!nf->tx_ring) {
+                                AFXDP_LOG_ERR("Chain init: rte_ring_create TX failed for NF %u", i);
+                                rte_ring_free((struct rte_ring *)nf->rx_ring);
+                                nf->rx_ring = NULL;
+                                goto fail_rings;
+                        }
 
-                /* Create custom SPSC TX ring */
-                snprintf(ring_name, sizeof(ring_name), "nf%u_tx", i);
-                nf->tx_ring_custom = afxdp_ring_create(ring_name,
-                                                        AFXDP_NF_RING_SIZE);
-                if (!nf->tx_ring_custom) {
-                        AFXDP_LOG_ERR("Chain init: failed to create TX ring for NF %u", i);
-                        afxdp_ring_free(nf->rx_ring_custom);
                         nf->rx_ring_custom = NULL;
-                        goto fail_rings;
+                        nf->tx_ring_custom = NULL;
+#endif
+                } else {
+                        nf->rx_ring = NULL;
+                        nf->tx_ring = NULL;
+
+                        /* Create custom SPSC RX ring */
+                        snprintf(ring_name, sizeof(ring_name), "nf%u_rx", i);
+                        nf->rx_ring_custom = afxdp_ring_create(ring_name,
+                                                                AFXDP_NF_RING_SIZE);
+                        if (!nf->rx_ring_custom) {
+                                AFXDP_LOG_ERR("Chain init: failed to create RX ring for NF %u", i);
+                                goto fail_rings;
+                        }
+
+                        /* Create custom SPSC TX ring */
+                        snprintf(ring_name, sizeof(ring_name), "nf%u_tx", i);
+                        nf->tx_ring_custom = afxdp_ring_create(ring_name,
+                                                                AFXDP_NF_RING_SIZE);
+                        if (!nf->tx_ring_custom) {
+                                AFXDP_LOG_ERR("Chain init: failed to create TX ring for NF %u", i);
+                                afxdp_ring_free(nf->rx_ring_custom);
+                                nf->rx_ring_custom = NULL;
+                                goto fail_rings;
+                        }
                 }
 
-                /* Register simple_forward handler for all NFs in Phase-1 */
                 nf->handler = afxdp_simple_forward_handler;
-
-                /* Set up chain order */
                 chain->chain_order[i] = i;
-
-                /* Zero stats */
                 memset(&nf->stats, 0, sizeof(nf->stats));
 
-                AFXDP_LOG_INFO("Chain: NF %u initialized (simple_forward)", i);
+                AFXDP_LOG_INFO("Chain: NF %u initialized", i);
         }
 
         ctx->chain = chain;
@@ -190,8 +219,17 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
 fail_rings:
         /* Clean up any rings we already created */
         for (uint16_t j = 0; j < i; j++) {
-                afxdp_ring_free(chain->nfs[j].rx_ring_custom);
-                afxdp_ring_free(chain->nfs[j].tx_ring_custom);
+                if (chain->ring_backend == AFXDP_RING_BE_RTE) {
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+                        if (chain->nfs[j].rx_ring)
+                                rte_ring_free((struct rte_ring *)chain->nfs[j].rx_ring);
+                        if (chain->nfs[j].tx_ring)
+                                rte_ring_free((struct rte_ring *)chain->nfs[j].tx_ring);
+#endif
+                } else {
+                        afxdp_ring_free(chain->nfs[j].rx_ring_custom);
+                        afxdp_ring_free(chain->nfs[j].tx_ring_custom);
+                }
         }
         free(chain->holder_free_stack);
         free(chain->holder_pool);
@@ -431,32 +469,60 @@ afxdp_chain_teardown(struct afxdp_manager_ctx *ctx) {
                 struct afxdp_nf *nf = &chain->nfs[i];
                 struct afxdp_pkt_holder *holder;
 
-                /* Drain RX ring — reclaim UMEM frames */
-                if (nf->rx_ring_custom) {
-                        while (afxdp_ring_dequeue_burst(
-                                       nf->rx_ring_custom,
-                                       (void **)&holder, 1) > 0) {
-                                if (chain->xsk)
-                                        afxdp_free_umem_frame(chain->xsk,
-                                                              holder->desc.umem_addr);
-                                afxdp_holder_free(chain, holder);
+                if (chain->ring_backend == AFXDP_RING_BE_RTE) {
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+                        /* Drain and free rte_ring RX */
+                        if (nf->rx_ring) {
+                                while (rte_ring_dequeue(
+                                               (struct rte_ring *)nf->rx_ring,
+                                               (void **)&holder) == 0) {
+                                        if (chain->xsk)
+                                                afxdp_free_umem_frame(chain->xsk,
+                                                                      holder->desc.umem_addr);
+                                        afxdp_holder_free(chain, holder);
+                                }
+                                rte_ring_free((struct rte_ring *)nf->rx_ring);
+                                nf->rx_ring = NULL;
                         }
-                        afxdp_ring_free(nf->rx_ring_custom);
-                        nf->rx_ring_custom = NULL;
-                }
-
-                /* Drain TX ring — reclaim UMEM frames */
-                if (nf->tx_ring_custom) {
-                        while (afxdp_ring_dequeue_burst(
-                                       nf->tx_ring_custom,
-                                       (void **)&holder, 1) > 0) {
-                                if (chain->xsk)
-                                        afxdp_free_umem_frame(chain->xsk,
-                                                              holder->desc.umem_addr);
-                                afxdp_holder_free(chain, holder);
+                        /* Drain and free rte_ring TX */
+                        if (nf->tx_ring) {
+                                while (rte_ring_dequeue(
+                                               (struct rte_ring *)nf->tx_ring,
+                                               (void **)&holder) == 0) {
+                                        if (chain->xsk)
+                                                afxdp_free_umem_frame(chain->xsk,
+                                                                      holder->desc.umem_addr);
+                                        afxdp_holder_free(chain, holder);
+                                }
+                                rte_ring_free((struct rte_ring *)nf->tx_ring);
+                                nf->tx_ring = NULL;
                         }
-                        afxdp_ring_free(nf->tx_ring_custom);
-                        nf->tx_ring_custom = NULL;
+#endif
+                } else {
+                        if (nf->rx_ring_custom) {
+                                while (afxdp_ring_dequeue_burst(
+                                               nf->rx_ring_custom,
+                                               (void **)&holder, 1) > 0) {
+                                        if (chain->xsk)
+                                                afxdp_free_umem_frame(chain->xsk,
+                                                                      holder->desc.umem_addr);
+                                        afxdp_holder_free(chain, holder);
+                                }
+                                afxdp_ring_free(nf->rx_ring_custom);
+                                nf->rx_ring_custom = NULL;
+                        }
+                        if (nf->tx_ring_custom) {
+                                while (afxdp_ring_dequeue_burst(
+                                               nf->tx_ring_custom,
+                                               (void **)&holder, 1) > 0) {
+                                        if (chain->xsk)
+                                                afxdp_free_umem_frame(chain->xsk,
+                                                                      holder->desc.umem_addr);
+                                        afxdp_holder_free(chain, holder);
+                                }
+                                afxdp_ring_free(nf->tx_ring_custom);
+                                nf->tx_ring_custom = NULL;
+                        }
                 }
                 nf->active = false;
         }

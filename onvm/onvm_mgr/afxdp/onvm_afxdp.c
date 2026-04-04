@@ -70,6 +70,10 @@
 #include <sys/utsname.h> /* uname                                      */
 #include <dirent.h>      /* opendir, readdir, closedir                  */
 
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+#include <rte_ring.h>
+#endif
+
 /* MAP_HUGE_2MB: request 2 MiB pages when combined with MAP_HUGETLB.
  * Defined in <linux/mman.h> on modern kernels; provide fallback. */
 #ifndef MAP_HUGE_2MB
@@ -88,6 +92,8 @@ static void afxdp_rx_and_process(struct afxdp_manager_ctx *ctx);
 
 /* Worker threads */
 static void *afxdp_rx_thread_main(void *arg);
+static void *afxdp_tx_thread_main(void *arg);
+static void *afxdp_dummy_nf_thread(void *arg);
 static void *afxdp_mgr_thread_main(void *arg);
 static void *afxdp_wakeup_thread_main(void *arg);
 
@@ -1043,11 +1049,6 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
 
         /* Step 3: Process each received packet */
         if (ctx->chain) {
-                /*
-                 * ---- Chained mode ----
-                 * Create a pkt_holder for each RX packet and enqueue
-                 * it to the first NF's RX ring.
-                 */
                 struct afxdp_chain_ctx *chain = ctx->chain;
                 struct afxdp_nf *first_nf = &chain->nfs[chain->chain_order[0]];
 
@@ -1057,14 +1058,12 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
 
                         struct afxdp_pkt_holder *holder = afxdp_holder_alloc(chain);
                         if (!holder) {
-                                /* No free holders — drop */
                                 afxdp_free_umem_frame(xsk, addr);
                                 xsk->stats.rx_dropped++;
                                 xsk->stats.rx_bytes += len;
                                 continue;
                         }
 
-                        /* Fill holder */
                         holder->desc.umem_addr = addr;
                         holder->desc.len = len;
                         holder->meta.action = AFXDP_NF_ACTION_NEXT;
@@ -1072,24 +1071,36 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
                         holder->meta.destination = 0;
                         holder->meta.flags = 0;
 
-                        /* Enqueue to first NF's RX ring */
-                        if (afxdp_ring_enqueue(first_nf->rx_ring_custom, holder) != 0) {
-                                /* First NF's ring full — drop */
-                                afxdp_holder_free(chain, holder);
-                                afxdp_free_umem_frame(xsk, addr);
-                                xsk->stats.rx_dropped++;
+                        if (chain->ring_backend == AFXDP_RING_BE_RTE) {
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+                                if (rte_ring_enqueue(
+                                        (struct rte_ring *)first_nf->rx_ring,
+                                        holder) != 0) {
+                                        afxdp_holder_free(chain, holder);
+                                        afxdp_free_umem_frame(xsk, addr);
+                                        xsk->stats.rx_dropped++;
+                                }
+#endif
+                        } else {
+                                if (afxdp_ring_enqueue(first_nf->rx_ring_custom,
+                                                       holder) != 0) {
+                                        afxdp_holder_free(chain, holder);
+                                        afxdp_free_umem_frame(xsk, addr);
+                                        xsk->stats.rx_dropped++;
+                                }
                         }
 
                         xsk->stats.rx_bytes += len;
                 }
 
-                /* Run the chain forward loop */
-                struct afxdp_pkt_holder *egress[AFXDP_RX_BATCH_SIZE];
-                uint32_t egress_count = afxdp_chain_forward(
-                        chain, egress, AFXDP_RX_BATCH_SIZE);
-
-                /* Submit egress packets to XSK TX ring */
-                afxdp_submit_egress(ctx, egress, egress_count);
+                /* In custom SPSC mode, run chain inline and submit egress.
+                 * In RTE mode, the TX thread handles egress asynchronously. */
+                if (chain->ring_backend != AFXDP_RING_BE_RTE) {
+                        struct afxdp_pkt_holder *egress[AFXDP_RX_BATCH_SIZE];
+                        uint32_t egress_count = afxdp_chain_forward(
+                                chain, egress, AFXDP_RX_BATCH_SIZE);
+                        afxdp_submit_egress(ctx, egress, egress_count);
+                }
 
         } else {
                 /*
@@ -1205,6 +1216,172 @@ afxdp_rx_thread_main(void *arg) {
         struct afxdp_manager_ctx *ctx = (struct afxdp_manager_ctx *)arg;
 
         afxdp_rx_and_process(ctx);
+        return NULL;
+}
+
+/****************************************************************************
+ *
+ *                        TX THREAD
+ *
+ *   Drains each NF's tx_ring (rte_ring), routes packets by action,
+ *   and submits egress packets to the AF_XDP socket.
+ *
+ ****************************************************************************/
+
+static void *
+afxdp_tx_thread_main(void *arg) {
+        struct afxdp_manager_ctx *ctx = (struct afxdp_manager_ctx *)arg;
+        struct afxdp_chain_ctx *chain = ctx->chain;
+
+        if (!chain) {
+                AFXDP_LOG_WARN("TX thread: no chain context, exiting");
+                return NULL;
+        }
+
+        AFXDP_LOG_INFO("TX thread started (NFs=%u)", chain->chain_length);
+
+        while (!ctx->global_exit) {
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+                uint16_t n;
+
+                for (n = 0; n < chain->chain_length; n++) {
+                        struct afxdp_nf *nf = &chain->nfs[chain->chain_order[n]];
+                        struct afxdp_pkt_holder *batch[AFXDP_NF_RING_BURST];
+                        unsigned dequeued, j;
+
+                        if (!nf->active || !nf->tx_ring)
+                                continue;
+
+                        dequeued = rte_ring_dequeue_burst(
+                                (struct rte_ring *)nf->tx_ring,
+                                (void **)batch, AFXDP_NF_RING_BURST, NULL);
+
+                        for (j = 0; j < dequeued; j++) {
+                                struct afxdp_pkt_holder *pkt = batch[j];
+
+                                switch (pkt->meta.action) {
+                                case AFXDP_NF_ACTION_NEXT: {
+                                        uint16_t next_pos = nf->chain_position + 1;
+                                        if (next_pos < chain->chain_length) {
+                                                uint16_t next_id = chain->chain_order[next_pos];
+                                                struct afxdp_nf *next_nf = &chain->nfs[next_id];
+                                                pkt->meta.chain_index = next_pos;
+                                                if (rte_ring_enqueue(
+                                                        (struct rte_ring *)next_nf->rx_ring,
+                                                        pkt) != 0) {
+                                                        nf->stats.dropped++;
+                                                        afxdp_free_umem_frame(chain->xsk,
+                                                                              pkt->desc.umem_addr);
+                                                        afxdp_holder_free(chain, pkt);
+                                                }
+                                        } else {
+                                                /* Last NF — treat as OUT */
+                                                afxdp_submit_egress(ctx, &pkt, 1);
+                                                nf->stats.tx_packets++;
+                                                nf->stats.tx_bytes += pkt->desc.len;
+                                        }
+                                        break;
+                                }
+                                case AFXDP_NF_ACTION_OUT:
+                                        afxdp_submit_egress(ctx, &pkt, 1);
+                                        nf->stats.tx_packets++;
+                                        nf->stats.tx_bytes += pkt->desc.len;
+                                        break;
+
+                                case AFXDP_NF_ACTION_TONF: {
+                                        uint16_t dest = pkt->meta.destination;
+                                        if (dest < chain->chain_length &&
+                                            chain->nfs[dest].active) {
+                                                if (rte_ring_enqueue(
+                                                        (struct rte_ring *)chain->nfs[dest].rx_ring,
+                                                        pkt) != 0) {
+                                                        nf->stats.dropped++;
+                                                        afxdp_free_umem_frame(chain->xsk,
+                                                                              pkt->desc.umem_addr);
+                                                        afxdp_holder_free(chain, pkt);
+                                                }
+                                        } else {
+                                                nf->stats.dropped++;
+                                                afxdp_free_umem_frame(chain->xsk,
+                                                                      pkt->desc.umem_addr);
+                                                afxdp_holder_free(chain, pkt);
+                                        }
+                                        break;
+                                }
+                                case AFXDP_NF_ACTION_DROP:
+                                default:
+                                        nf->stats.dropped++;
+                                        afxdp_free_umem_frame(chain->xsk,
+                                                              pkt->desc.umem_addr);
+                                        afxdp_holder_free(chain, pkt);
+                                        break;
+                                }
+                        }
+                }
+
+                /* Complete any outstanding TX operations */
+                afxdp_complete_tx(ctx->xsk_socket);
+#endif
+        }
+
+        AFXDP_LOG_INFO("TX thread exited");
+        return NULL;
+}
+
+/****************************************************************************
+ *
+ *                        DUMMY NF THREAD
+ *
+ *   Simulates an asynchronous external NF. Pulls packets from its
+ *   rx_ring, sets ACTION_OUT, and pushes them to its tx_ring.
+ *   This validates the decoupled RX/TX ring pipeline.
+ *
+ ****************************************************************************/
+
+struct afxdp_dummy_nf_arg {
+        struct afxdp_manager_ctx *ctx;
+        uint16_t nf_idx;
+};
+
+static void *
+afxdp_dummy_nf_thread(void *arg) {
+        struct afxdp_dummy_nf_arg *nf_arg = (struct afxdp_dummy_nf_arg *)arg;
+        struct afxdp_manager_ctx *ctx = nf_arg->ctx;
+        struct afxdp_chain_ctx *chain = ctx->chain;
+        struct afxdp_nf *nf = &chain->nfs[nf_arg->nf_idx];
+
+        AFXDP_LOG_INFO("Dummy NF %u thread started", nf->nf_id);
+
+        while (!ctx->global_exit) {
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+                struct afxdp_pkt_holder *batch[AFXDP_NF_RING_BURST];
+                unsigned dequeued, j;
+
+                dequeued = rte_ring_dequeue_burst(
+                        (struct rte_ring *)nf->rx_ring,
+                        (void **)batch, AFXDP_NF_RING_BURST, NULL);
+
+                for (j = 0; j < dequeued; j++) {
+                        struct afxdp_pkt_holder *pkt = batch[j];
+
+                        nf->stats.rx_packets++;
+                        nf->stats.rx_bytes += pkt->desc.len;
+
+                        pkt->meta.action = AFXDP_NF_ACTION_OUT;
+
+                        if (rte_ring_enqueue(
+                                (struct rte_ring *)nf->tx_ring, pkt) != 0) {
+                                nf->stats.dropped++;
+                                afxdp_free_umem_frame(chain->xsk,
+                                                      pkt->desc.umem_addr);
+                                afxdp_holder_free(chain, pkt);
+                        }
+                }
+#endif
+        }
+
+        AFXDP_LOG_INFO("Dummy NF %u thread exited", nf->nf_id);
+        free(nf_arg);
         return NULL;
 }
 
@@ -1434,15 +1611,21 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
 int
 afxdp_run(struct afxdp_manager_ctx *ctx) {
         pthread_t rx_threads[AFXDP_NUM_RX_THREADS];
+        pthread_t tx_threads[AFXDP_NUM_TX_THREADS];
         pthread_t mgr_threads[AFXDP_NUM_MGR_AUX_THREADS];
         pthread_t wakeup_threads[AFXDP_NUM_WAKEUP_THREADS];
         int i, err;
+
+        /* Dummy NF threads (one per NF in the chain, RTE mode only) */
+        uint16_t num_nf_threads = 0;
+        pthread_t nf_threads[AFXDP_MAX_NFS];
 
         AFXDP_LOG_INFO("Launching worker threads: "
                        "RX=%d  TX=%d  Mgr=%d  Wakeup=%d",
                        AFXDP_NUM_RX_THREADS, AFXDP_NUM_TX_THREADS,
                        AFXDP_NUM_MGR_AUX_THREADS, AFXDP_NUM_WAKEUP_THREADS);
 
+        /* ---- RX threads ---- */
         for (i = 0; i < AFXDP_NUM_RX_THREADS; i++) {
                 err = pthread_create(&rx_threads[i], NULL,
                                      afxdp_rx_thread_main, ctx);
@@ -1454,6 +1637,40 @@ afxdp_run(struct afxdp_manager_ctx *ctx) {
                 }
         }
 
+        /* ---- TX threads (RTE backend only) ---- */
+        for (i = 0; i < AFXDP_NUM_TX_THREADS; i++) {
+                err = pthread_create(&tx_threads[i], NULL,
+                                     afxdp_tx_thread_main, ctx);
+                if (err) {
+                        AFXDP_LOG_ERR("Failed to create TX thread %d: %s",
+                                      i, strerror(err));
+                        ctx->global_exit = true;
+                        break;
+                }
+        }
+
+        /* ---- Dummy NF threads (one per NF, RTE backend) ---- */
+        if (ctx->chain &&
+            ctx->chain->ring_backend == AFXDP_RING_BE_RTE) {
+                num_nf_threads = ctx->chain->chain_length;
+                AFXDP_LOG_INFO("Launching %u dummy NF threads", num_nf_threads);
+                for (i = 0; i < num_nf_threads; i++) {
+                        struct afxdp_dummy_nf_arg *arg = malloc(sizeof(*arg));
+                        arg->ctx = ctx;
+                        arg->nf_idx = i;
+                        err = pthread_create(&nf_threads[i], NULL,
+                                             afxdp_dummy_nf_thread, arg);
+                        if (err) {
+                                AFXDP_LOG_ERR("Failed to create NF thread %d: %s",
+                                              i, strerror(err));
+                                free(arg);
+                                ctx->global_exit = true;
+                                break;
+                        }
+                }
+        }
+
+        /* ---- Mgr threads ---- */
         for (i = 0; i < AFXDP_NUM_MGR_AUX_THREADS; i++) {
                 err = pthread_create(&mgr_threads[i], NULL,
                                      afxdp_mgr_thread_main, ctx);
@@ -1465,6 +1682,7 @@ afxdp_run(struct afxdp_manager_ctx *ctx) {
                 }
         }
 
+        /* ---- Wakeup threads ---- */
         for (i = 0; i < AFXDP_NUM_WAKEUP_THREADS; i++) {
                 err = pthread_create(&wakeup_threads[i], NULL,
                                      afxdp_wakeup_thread_main, ctx);
@@ -1476,8 +1694,13 @@ afxdp_run(struct afxdp_manager_ctx *ctx) {
                 }
         }
 
+        /* ---- Join all ---- */
         for (i = 0; i < AFXDP_NUM_RX_THREADS; i++)
                 pthread_join(rx_threads[i], NULL);
+        for (i = 0; i < AFXDP_NUM_TX_THREADS; i++)
+                pthread_join(tx_threads[i], NULL);
+        for (i = 0; i < (int)num_nf_threads; i++)
+                pthread_join(nf_threads[i], NULL);
         for (i = 0; i < AFXDP_NUM_MGR_AUX_THREADS; i++)
                 pthread_join(mgr_threads[i], NULL);
         for (i = 0; i < AFXDP_NUM_WAKEUP_THREADS; i++)

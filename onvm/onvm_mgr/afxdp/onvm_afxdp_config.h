@@ -100,10 +100,9 @@
 /* Number of RX threads (one per AF_XDP socket / NIC queue). */
 #define AFXDP_NUM_RX_THREADS         1
 
-/* Number of TX threads. Zero because TX is a zero-copy bounce
- * performed inline by the RX thread. Will increase when NF
- * chaining with separate TX queues is added. */
-#define AFXDP_NUM_TX_THREADS         0
+/* Number of TX threads. Drains NF tx_rings and submits
+ * packets to the AF_XDP socket for NIC egress. */
+#define AFXDP_NUM_TX_THREADS         1
 
 /* Number of auxiliary management threads (stats, TTL/pkt-limit
  * checks, graceful shutdown coordination). */
@@ -186,7 +185,7 @@
 #define AFXDP_RING_BACKEND_CUSTOM    1   /* Custom lockfree SPSC ring      */
 
 /* Default ring backend for this build. */
-#define AFXDP_DEFAULT_RING_BACKEND   AFXDP_RING_BACKEND_CUSTOM
+#define AFXDP_DEFAULT_RING_BACKEND   AFXDP_RING_BACKEND_RTE
 
 /**********************Socket Topology (Chain Mode)**************************/
 
