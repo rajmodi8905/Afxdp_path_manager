@@ -72,6 +72,12 @@ fi
 # Source DPDK helper functions
 . "$ONVM_HOME"/scripts/dpdk_helper_scripts.sh
 
+DPDK_DRIVER="${ONVM_DPDK_DRIVER:-vfio-pci}"
+if [ "$DPDK_DRIVER" != "igb_uio" ] && [ "$DPDK_DRIVER" != "vfio-pci" ]; then
+    echo "Unsupported ONVM_DPDK_DRIVER=$DPDK_DRIVER (use igb_uio or vfio-pci)"
+    exit 1
+fi
+
 # Disable ASLR
 sudo sh -c "echo 0 > /proc/sys/kernel/randomize_va_space"
 
@@ -87,14 +93,19 @@ sudo -v
 
 # Load uio kernel modules
 grep -m 1 "igb_uio" /proc/modules | cat
-if [ "${PIPESTATUS[0]}" != 0 ]; then
-    echo "Loading uio kernel modules"
+if [ "$DPDK_DRIVER" = "igb_uio" ] && [ "${PIPESTATUS[0]}" != 0 ]; then
+    echo "Loading igb_uio kernel modules"
     sleep 1
     cd "$RTE_SDK"/"$RTE_TARGET"/kmod
     sudo modprobe uio
     sudo insmod igb_uio.ko
+elif [ "$DPDK_DRIVER" = "vfio-pci" ]; then
+    echo "Loading vfio-pci kernel modules"
+    sleep 1
+    sudo modprobe vfio
+    sudo modprobe vfio-pci
 else
-    echo "IGB UIO module already loaded."
+    echo "Kernel modules for $DPDK_DRIVER already loaded."
 fi
 
 # dpdk_nic_bind.py has been changed to dpdk-devbind.py to be compatible with DPDK 16.11
@@ -104,12 +115,12 @@ $DPDK_DEVBIND --status
 
 echo "Binding NIC status"
 if [ -z "$ONVM_NIC_PCI" ];then
-    for id in $($DPDK_DEVBIND --status | grep -v Active | grep -e "10G" -e "10-Gigabit" | grep unused=igb_uio | cut -f 1 -d " ")
+    for id in $($DPDK_DEVBIND --status | grep -v Active | grep -e "10G" -e "10-Gigabit" | grep "unused=$DPDK_DRIVER" | cut -f 1 -d " ")
     do
         read -r -p "Bind interface $id to DPDK? [y/N] " response
         if [[ $response =~ ^([yY][eE][sS]|[yY])$ ]];then
             echo "Binding $id to dpdk"
-            sudo "$DPDK_DEVBIND" -b igb_uio "$id"
+            sudo "$DPDK_DEVBIND" -b "$DPDK_DRIVER" "$id"
         fi
     done
 else
@@ -117,7 +128,7 @@ else
     for nic_id in $ONVM_NIC_PCI
     do
         echo "Binding $nic_id to DPDK"
-        sudo "$DPDK_DEVBIND" -b igb_uio "$nic_id"
+        sudo "$DPDK_DEVBIND" -b "$DPDK_DRIVER" "$nic_id"
     done
 fi
 

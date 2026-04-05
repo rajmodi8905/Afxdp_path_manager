@@ -54,6 +54,7 @@ echo "RTE_TARGET: $RTE_TARGET"
 echo "ONVM_NUM_HUGEPAGES: $ONVM_NUM_HUGEPAGES"
 echo "ONVM_SKIP_HUGEPAGES: $ONVM_SKIP_HUGEPAGES"
 echo "ONVM_SKIP_FSTAB: $ONVM_SKIP_FSTAB"
+echo "ONVM_DPDK_DRIVER: ${ONVM_DPDK_DRIVER:-vfio-pci}"
 echo "----------------------------------------"
 
 if [ -z "$RTE_TARGET" ]; then
@@ -85,6 +86,12 @@ fi
 # Source DPDK helper functions
 . "$ONVM_HOME"/scripts/dpdk_helper_scripts.sh
 
+DPDK_DRIVER="${ONVM_DPDK_DRIVER:-vfio-pci}"
+if [ "$DPDK_DRIVER" != "igb_uio" ] && [ "$DPDK_DRIVER" != "vfio-pci" ]; then
+    echo "Unsupported ONVM_DPDK_DRIVER=$DPDK_DRIVER (use igb_uio or vfio-pci)"
+    exit 1
+fi
+
 set +e
 remove_igb_uio_module
 set -e
@@ -105,10 +112,15 @@ fi
 
 sed -i 's/CONFIG_RTE_EAL_IGB_UIO=n/CONFIG_RTE_EAL_IGB_UIO=y/g' "$RTE_SDK"/config/common_base
 
+if [ "$DPDK_DRIVER" = "vfio-pci" ]; then
+    sed -i 's/CONFIG_RTE_EAL_IGB_UIO=y/CONFIG_RTE_EAL_IGB_UIO=n/g' "$RTE_SDK"/config/common_base
+    sed -i 's/CONFIG_RTE_EAL_VFIO=n/CONFIG_RTE_EAL_VFIO=y/g' "$RTE_SDK"/config/common_base
+fi
+
 sleep 1
 make config T="$RTE_TARGET"
-make T="$RTE_TARGET" -j 8
-make install T="$RTE_TARGET" -j 8
+make T="$RTE_TARGET" WERROR_FLAGS= HOST_WERROR_FLAGS= -j 8
+make install T="$RTE_TARGET" WERROR_FLAGS= HOST_WERROR_FLAGS= -j 8
 
 # Refresh sudo
 sudo -v

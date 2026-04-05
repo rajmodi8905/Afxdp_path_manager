@@ -46,6 +46,8 @@ ENABLE_FLOW_LOOKUP=1
 # ============================================================================
 MODE ?= DPDK
 
+ONVM_MGR_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+
 ifeq ($(RTE_SDK),)
 $(error "Please define RTE_SDK environment variable")
 endif
@@ -62,20 +64,19 @@ endif
 
 # ---- AF_XDP MODE -----------------------------------------------------------
 ifeq ($(MODE),AFXDP)
-
-# We link AF_XDP with DPDK's build framework so we get rte_ring and rte_eal headers/libs
 APP = onvm_mgr_afxdp
 SRCS-y := main.c afxdp/onvm_afxdp.c afxdp/onvm_afxdp_ring.c afxdp/onvm_afxdp_chain.c afxdp/nfs/afxdp_simple_forward.c
 
-CFLAGS += -O2 -Wall -Wextra -DUSE_AFXDP -I$(CURDIR)/afxdp
-LDFLAGS += -lxdp -lbpf -lelf -lz
+CFLAGS += -O2 -Wall -Wextra -DUSE_AFXDP -I$(ONVM_MGR_DIR)/afxdp
+LDFLAGS += -lxdp -lbpf -lelf -lz -lpthread
 
-# Execute the eBPF kernel object build before building the app
+# Build the eBPF kernel object before building the app. Use an absolute path
+# since DPDK's extapp flow may execute recipes from a different working dir.
 all: bpf
 
-.PHONY: bpf
+.PHONY: bpf	
 bpf:
-	$(MAKE) -C afxdp
+	$(MAKE) -C $(ONVM_MGR_DIR)/afxdp
 
 # ---- DPDK MODE (original) --------------------------------------------------
 else
