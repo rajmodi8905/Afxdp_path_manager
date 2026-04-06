@@ -108,7 +108,7 @@ struct onvm_service_chain *default_chain;
 struct onvm_configuration *onvm_config;
 
 /* Flag to check if shared core mutex sleep/wakeup is enabled */
-uint8_t ONVM_NF_SHARE_CORES = ONVM_NF_SHARE_CORES_DEFAULT;
+uint8_t ONVM_NF_SHARE_CORES;
 
 /***********************Internal Functions Prototypes*************************/
 
