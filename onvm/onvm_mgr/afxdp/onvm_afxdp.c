@@ -1337,7 +1337,7 @@ afxdp_tx_thread_main(void *arg) {
  *                        DUMMY NF THREAD
  *
  *   Simulates an asynchronous external NF. Pulls packets from its
- *   rx_ring, sets ACTION_OUT, and pushes them to its tx_ring.
+ *   rx_ring, sets ACTION_NEXT, and pushes them to its tx_ring.
  *   This validates the decoupled RX/TX ring pipeline.
  *
  ****************************************************************************/
@@ -1371,7 +1371,7 @@ afxdp_dummy_nf_thread(void *arg) {
                         nf->stats.rx_packets++;
                         nf->stats.rx_bytes += pkt->desc.len;
 
-                        pkt->meta.action = AFXDP_NF_ACTION_OUT;
+                        pkt->meta.action = AFXDP_NF_ACTION_NEXT;
 
                         if (rte_ring_enqueue(
                                 (struct rte_ring *)nf->tx_ring, pkt) != 0) {
