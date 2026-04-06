@@ -551,11 +551,20 @@ afxdp_preflight_checks(struct afxdp_config *cfg) {
         if (fgets(buf, sizeof(buf), f)) {
                 buf[strcspn(buf, "\n")] = '\0';
                 if (strcmp(buf, "up") != 0) {
-                        AFXDP_LOG_ERR("Preflight: interface '%s' is '%s', "
-                                      "must be UP before attaching XDP",
-                                      cfg->ifname, buf);
-                        fclose(f);
-                        return -ENETDOWN;
+                        // AFXDP_LOG_ERR("Preflight: interface '%s' is '%s', "
+                        //               "must be UP before attaching XDP",
+                        //               cfg->ifname, buf);
+                        // fclose(f);
+                        // return -ENETDOWN;
+						AFXDP_LOG_WARN("Preflight: interface '%s' is '%s' (not 'up'); "
+                                       "continuing due to relaxed NIC-UP check",
+                                       cfg->ifname, buf);
+                        /*
+                         * Relaxed preflight for virtual/tunnel interfaces (e.g., tun/tap)
+                         * that may report operstate='unknown' while still being usable.
+                         */
+                        /* fclose(f); */
+                        /* return -ENETDOWN; */
                 }
         }
         fclose(f);
