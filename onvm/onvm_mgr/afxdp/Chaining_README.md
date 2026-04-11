@@ -13,6 +13,21 @@ Two ring backends are supported. The backend is selected at compile time via `AF
 
 ---
 
+## Usage
+
+The AF_XDP manager can be run in legacy bounce mode or native NF chaining mode. The `-C` flag enables native NF chaining by defining a sequence of NFs to run.
+
+```bash
+# Run in legacy bounce mode (no NFs):
+./onvm_mgr_afxdp -d eth0 -v
+
+# Run with native AF_XDP NF chaining:
+./onvm_mgr_afxdp -d eth0 -C "firewall,bridge,simple_forward" -v
+```
+*Note: NFs specified in the `-C` flag must be implemented as native AF_XDP NFs (which bypass DPDK `rte_mbuf` overhead).*
+
+---
+
 ## File Map
 
 | File | Role |
@@ -39,7 +54,7 @@ XDP program (kernel) ──redirect──► AF_XDP RX ring
   │
   ▼
 afxdp_handle_receive()
-  ├─ allocate afxdp_pkt_holder from holder pool
+  ├─ pop preallocated afxdp_pkt_holder from embedded UMEM pool
   ├─ populate holder with (umem_addr, len, ACTION_NEXT)
   └─ enqueue holder to NF[0].rx_ring
         │
@@ -67,10 +82,10 @@ afxdp_submit_egress() → XSK TX ring → NIC TX
 
 | Function | Description |
 |---|---|
-| `afxdp_holder_alloc(chain)` | Pop a free `afxdp_pkt_holder` from the stack-based free-list. Returns `NULL` if pool exhausted. |
+| `afxdp_holder_alloc(chain)` | Pop a pre-allocated `afxdp_pkt_holder` from the free-list. Returns `NULL` if pool exhausted. |
 | `afxdp_holder_free(chain, holder)` | Push a holder back onto the free-list. |
 
-The pool is pre-allocated at chain init with `AFXDP_PKT_HOLDER_POOL_SIZE` (4096) entries. A `holder_free_stack[]` array stores indices of available holders; `holder_free_count` tracks the stack top.
+The holder pool is strongly coupled with the UMEM memory region. By default, it is **embedded directly within the hugepage UMEM allocation** to maximize cache locality and eliminate overhead. The pool is pre-allocated at chain init; no `malloc`/`free` is performed per-packet. Free-lists are implemented as a lockless `rte_ring` (RTE mode) or a simple stack (Custom mode).
 
 ### `afxdp_chain_init(ctx, num_nfs)`
 
@@ -222,7 +237,7 @@ With the default chain length of 2 NFs:
 [RX Thread]
   poll/busy-wait XSK RX ring
   for each packet:
-    holder = afxdp_holder_alloc()
+    holder = afxdp_holder_alloc()  // pops preallocated holder
     holder.desc = {umem_addr, len}
     holder.meta.action = ACTION_NEXT
     afxdp_ring_enqueue(NF[0].rx_ring_custom, holder)
@@ -245,7 +260,7 @@ The entire datapath (RX → NF processing → action routing → TX) executes on
 [RX Thread]                        [NF Thread i]                  [TX Thread]
   poll XSK RX ring                   while (!exit):                 while (!exit):
   for each packet:                     dequeue NF[i].rx_ring          for each NF:
-    holder = alloc()                   handler(pkt)                     dequeue NF.tx_ring
+    holder = pop_preallocated()        handler(pkt)                     dequeue NF.tx_ring
     enqueue NF[0].rx_ring              pkt.action = NEXT                route by action:
                                        enqueue NF[i].tx_ring              NEXT → NF[j].rx_ring
                                                                           OUT  → submit_egress()
@@ -277,7 +292,7 @@ struct afxdp_pkt_holder {
 };
 ```
 
-Allocated from a pre-allocated pool (`holder_pool[]` + `holder_free_stack[]`). No `malloc`/`free` in the hot path.
+To guarantee zero per-packet allocation overhead, holders are **pre-allocated at startup and embedded directly into the hugepage UMEM region**. Free-lists are maintained via `rte_ring` (in RTE mode) or stack arrays (in Custom mode). Absolutely no `malloc`/`free` occurs in the hot path.
 
 ### `afxdp_nf`
 
