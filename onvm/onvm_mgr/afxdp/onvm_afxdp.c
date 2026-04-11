@@ -94,6 +94,7 @@ static void afxdp_rx_and_process(struct afxdp_manager_ctx *ctx);
 static void *afxdp_rx_thread_main(void *arg);
 static void *afxdp_tx_thread_main(void *arg);
 static void *afxdp_dummy_nf_thread(void *arg);
+static void *afxdp_real_nf_thread(void *arg);
 static void *afxdp_mgr_thread_main(void *arg);
 static void *afxdp_wakeup_thread_main(void *arg);
 
@@ -149,6 +150,7 @@ afxdp_print_usage(const char *prog) {
                 "  -p              Use poll() instead of busy-wait\n"
                 "  -f <file.o>     Custom XDP kernel object file\n"
                 "  -P <progname>   XDP program section name\n"
+                "  -C <chain>      NF chain spec (comma-separated, e.g. \"simple_forward,firewall\")\n"
                 "  -v              Verbose output (enable stats)\n"
                 "  -t <seconds>    Time to live (auto-shutdown)\n"
                 "  -l <packets>    Packet limit (auto-shutdown)\n"
@@ -176,11 +178,13 @@ afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv) {
         cfg->verbose = false;
         cfg->time_to_live = 0;
         cfg->pkt_limit = 0;
+        cfg->nf_chain_spec[0] = '\0';
+        cfg->use_real_nfs = false;
 
         /* Reset getopt for re-entrant parsing (manager already parsed EAL args) */
         optind = 1;
 
-        while ((opt = getopt(argc, argv, "d:Q:SNczpf:P:vt:l:h")) != -1) {
+        while ((opt = getopt(argc, argv, "d:Q:SNczpf:P:vt:l:C:h")) != -1) {
                 switch (opt) {
                 case 'd':
                         strncpy(cfg->ifname, optarg, IF_NAMESIZE - 1);
@@ -221,6 +225,12 @@ afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv) {
                 case 'l':
                         cfg->pkt_limit = (uint64_t)atoll(optarg);
                         break;
+                case 'C':
+                        strncpy(cfg->nf_chain_spec, optarg,
+                                sizeof(cfg->nf_chain_spec) - 1);
+                        cfg->nf_chain_spec[sizeof(cfg->nf_chain_spec) - 1] = '\0';
+                        cfg->use_real_nfs = true;
+                        break;
                 case 'h':
                 default:
                         afxdp_print_usage(argv[0]);
@@ -255,6 +265,8 @@ afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv) {
                 AFXDP_LOG_INFO("  TTL:         %u seconds", cfg->time_to_live);
         if (cfg->pkt_limit)
                 AFXDP_LOG_INFO("  Pkt Limit:   %lu", cfg->pkt_limit);
+        if (cfg->use_real_nfs)
+                AFXDP_LOG_INFO("  NF Chain:    %s", cfg->nf_chain_spec);
 }
 
 /****************************************************************************
@@ -1389,6 +1401,70 @@ afxdp_dummy_nf_thread(void *arg) {
         return NULL;
 }
 
+/****************************************************************************
+ *
+ *                        REAL NF THREAD
+ *
+ *   Runs a registered NF handler for each packet. Unlike the dummy
+ *   thread, it calls nf->function_table->pkt_handler which is
+ *   resolved from the NF registry at chain init time.
+ *
+ ****************************************************************************/
+
+static void *
+afxdp_real_nf_thread(void *arg) {
+        struct afxdp_dummy_nf_arg *nf_arg = (struct afxdp_dummy_nf_arg *)arg;
+        struct afxdp_manager_ctx *ctx = nf_arg->ctx;
+        struct afxdp_chain_ctx *chain = ctx->chain;
+        struct afxdp_nf *nf = &chain->nfs[nf_arg->nf_idx];
+
+        AFXDP_LOG_INFO("Real NF %u thread started", nf->nf_id);
+
+        /* Call NF setup if provided */
+        if (nf->function_table && nf->function_table->setup)
+                nf->function_table->setup(nf);
+
+        while (!ctx->global_exit) {
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+                struct afxdp_pkt_holder *batch[AFXDP_NF_RING_BURST];
+                unsigned dequeued, j;
+
+                dequeued = rte_ring_dequeue_burst(
+                        (struct rte_ring *)nf->rx_ring,
+                        (void **)batch, AFXDP_NF_RING_BURST, NULL);
+
+                for (j = 0; j < dequeued; j++) {
+                        struct afxdp_pkt_holder *pkt = batch[j];
+
+                        nf->stats.rx_packets++;
+                        nf->stats.rx_bytes += pkt->desc.len;
+
+                        /* Call the registered NF handler */
+                        if (nf->function_table && nf->function_table->pkt_handler)
+                                nf->function_table->pkt_handler(pkt, nf);
+                        else
+                                pkt->meta.action = AFXDP_NF_ACTION_NEXT;
+
+                        if (rte_ring_enqueue(
+                                (struct rte_ring *)nf->tx_ring, pkt) != 0) {
+                                nf->stats.dropped++;
+                                afxdp_free_umem_frame(chain->xsk,
+                                                       pkt->desc.umem_addr);
+                                afxdp_holder_free(chain, pkt);
+                        }
+                }
+#endif
+        }
+
+        /* Call NF teardown if provided */
+        if (nf->function_table && nf->function_table->teardown)
+                nf->function_table->teardown(nf);
+
+        AFXDP_LOG_INFO("Real NF %u thread exited", nf->nf_id);
+        free(nf_arg);
+        return NULL;
+}
+
 static void *
 afxdp_mgr_thread_main(void *arg) {
         struct afxdp_manager_ctx *ctx = (struct afxdp_manager_ctx *)arg;
@@ -1589,13 +1665,17 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
         /* ---- Step 9: Print hugepage status report ---- */
         afxdp_print_hugepage_status(ctx);
 
-        /* ---- Step 10: Initialize NF chain (2 NFs: simple_forward × 2) ---- */
+        /* ---- Step 10: Initialize NF chain ---- */
         {
-                int chain_err = afxdp_chain_init(ctx, 2);
+                int chain_err;
+                if (ctx->cfg.use_real_nfs) {
+                        chain_err = afxdp_chain_init_from_spec(ctx, ctx->cfg.nf_chain_spec);
+                } else {
+                        chain_err = afxdp_chain_init(ctx, 2);
+                }
                 if (chain_err) {
                         AFXDP_LOG_ERR("NF chain initialization failed (err=%d)",
                                       chain_err);
-                        /* Non-fatal: fall back to legacy bounce mode */
                         AFXDP_LOG_WARN("Running in legacy bounce mode (no NF chain)");
                 }
         }
@@ -1653,23 +1733,44 @@ afxdp_run(struct afxdp_manager_ctx *ctx) {
                 }
         }
 
-        /* ---- Dummy NF threads (one per NF, RTE backend) ---- */
+        /* ---- NF threads (one per NF, RTE backend) ---- */
         if (ctx->chain &&
             ctx->chain->ring_backend == AFXDP_RING_BE_RTE) {
                 num_nf_threads = ctx->chain->chain_length;
-                AFXDP_LOG_INFO("Launching %u dummy NF threads", num_nf_threads);
-                for (i = 0; i < num_nf_threads; i++) {
-                        struct afxdp_dummy_nf_arg *arg = malloc(sizeof(*arg));
-                        arg->ctx = ctx;
-                        arg->nf_idx = i;
-                        err = pthread_create(&nf_threads[i], NULL,
-                                             afxdp_dummy_nf_thread, arg);
-                        if (err) {
-                                AFXDP_LOG_ERR("Failed to create NF thread %d: %s",
-                                              i, strerror(err));
-                                free(arg);
-                                ctx->global_exit = true;
-                                break;
+
+                if (ctx->cfg.use_real_nfs) {
+                        AFXDP_LOG_INFO("Launching %u real NF threads",
+                                       num_nf_threads);
+                        for (i = 0; i < num_nf_threads; i++) {
+                                struct afxdp_dummy_nf_arg *arg = malloc(sizeof(*arg));
+                                arg->ctx = ctx;
+                                arg->nf_idx = i;
+                                err = pthread_create(&nf_threads[i], NULL,
+                                                      afxdp_real_nf_thread, arg);
+                                if (err) {
+                                        AFXDP_LOG_ERR("Failed to create real NF thread %d: %s",
+                                                      i, strerror(err));
+                                        free(arg);
+                                        ctx->global_exit = true;
+                                        break;
+                                }
+                        }
+                } else {
+                        AFXDP_LOG_INFO("Launching %u dummy NF threads",
+                                       num_nf_threads);
+                        for (i = 0; i < num_nf_threads; i++) {
+                                struct afxdp_dummy_nf_arg *arg = malloc(sizeof(*arg));
+                                arg->ctx = ctx;
+                                arg->nf_idx = i;
+                                err = pthread_create(&nf_threads[i], NULL,
+                                                      afxdp_dummy_nf_thread, arg);
+                                if (err) {
+                                        AFXDP_LOG_ERR("Failed to create NF thread %d: %s",
+                                                      i, strerror(err));
+                                        free(arg);
+                                        ctx->global_exit = true;
+                                        break;
+                                }
                         }
                 }
         }

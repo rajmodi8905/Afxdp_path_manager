@@ -137,4 +137,20 @@ afxdp_chain_print_stats(const struct afxdp_chain_ctx *chain);
 void
 afxdp_chain_teardown(struct afxdp_manager_ctx *ctx);
 
+/**
+ * Initialize the NF chain from a comma-separated NF type spec string.
+ *
+ * Tokenizes the spec (e.g. "simple_forward,firewall"), looks up each
+ * NF type in the registry, and assigns the handler function table.
+ *
+ * @param ctx
+ *   Manager context.
+ * @param spec
+ *   Comma-separated NF type names.
+ * @return
+ *   0 on success, negative errno on failure.
+ */
+int
+afxdp_chain_init_from_spec(struct afxdp_manager_ctx *ctx, const char *spec);
+
 #endif /* _ONVM_AFXDP_CHAIN_H_ */

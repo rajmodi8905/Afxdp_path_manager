@@ -193,6 +193,9 @@
 /* Default ring backend for this build. */
 #define AFXDP_DEFAULT_RING_BACKEND   AFXDP_RING_BACKEND_RTE
 
+/* Maximum number of NF types that can be registered in the NF registry. */
+#define AFXDP_MAX_NF_TYPES           32
+
 /**********************Socket Topology (Chain Mode)**************************/
 
 /* Index of the ingress XSK socket (NIC RX, chain entry). */

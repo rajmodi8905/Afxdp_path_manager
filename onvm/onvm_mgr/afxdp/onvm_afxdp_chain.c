@@ -52,6 +52,7 @@
 ******************************************************************************/
 
 #include "onvm_afxdp_chain.h"
+#include "onvm_afxdp_nf_registry.h"
 #include "nfs/afxdp_simple_forward.h"
 
 #include <string.h>
@@ -564,4 +565,63 @@ afxdp_chain_teardown(struct afxdp_manager_ctx *ctx) {
         ctx->chain = NULL;
 
         AFXDP_LOG_INFO("NF chain teardown complete");
+}
+
+/******************************* Spec-Based Init *******************************/
+
+int
+afxdp_chain_init_from_spec(struct afxdp_manager_ctx *ctx, const char *spec) {
+        char buf[512];
+        char *tokens[AFXDP_MAX_CHAIN_LENGTH];
+        uint16_t num_nfs = 0;
+        int ret;
+
+        /* Tokenize the comma-separated spec */
+        strncpy(buf, spec, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+
+        char *saveptr = NULL;
+        char *tok = strtok_r(buf, ",", &saveptr);
+        while (tok && num_nfs < AFXDP_MAX_CHAIN_LENGTH) {
+                /* Trim leading whitespace */
+                while (*tok == ' ') tok++;
+                tokens[num_nfs++] = tok;
+                tok = strtok_r(NULL, ",", &saveptr);
+        }
+
+        if (num_nfs == 0) {
+                AFXDP_LOG_ERR("Chain spec is empty");
+                return -EINVAL;
+        }
+
+        /* Validate all NF names before initializing */
+        for (uint16_t i = 0; i < num_nfs; i++) {
+                if (!afxdp_nf_lookup_type(tokens[i])) {
+                        AFXDP_LOG_ERR("NF type '%s' not found in registry", tokens[i]);
+                        afxdp_nf_print_registry();
+                        return -ENOENT;
+                }
+        }
+
+        /* Initialize the chain (creates rings, holder pool) */
+        ret = afxdp_chain_init(ctx, num_nfs);
+        if (ret)
+                return ret;
+
+        /* Assign function tables and packet_buffer to each NF */
+        for (uint16_t i = 0; i < num_nfs; i++) {
+                struct afxdp_nf_type *type = afxdp_nf_lookup_type(tokens[i]);
+                struct afxdp_nf *nf = &ctx->chain->nfs[i];
+
+                nf->function_table = &type->ftable;
+                nf->handler = type->ftable.pkt_handler;  /* keep in sync */
+                nf->packet_buffer = ctx->packet_buffer;
+                nf->nf_state = NULL;
+
+                AFXDP_LOG_INFO("Chain[%u]: %s (handler=%p)",
+                               i, tokens[i], (void *)(uintptr_t)type->ftable.pkt_handler);
+        }
+
+        AFXDP_LOG_INFO("Chain initialized from spec: \"%s\" (%u NFs)", spec, num_nfs);
+        return 0;
 }

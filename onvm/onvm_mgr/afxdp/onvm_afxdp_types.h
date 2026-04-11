@@ -186,6 +186,10 @@ struct afxdp_config {
         bool xsk_poll_mode;                   /* Use poll() instead of busy-wait */
         bool custom_xdp_prog;                 /* true if user supplied a custom .o */
         bool verbose;                         /* Enable verbose logging */
+
+        /* NF chain specification (comma-separated NF type names, from -C flag) */
+        char nf_chain_spec[512];
+        bool use_real_nfs;                    /* true when -C is provided */
 };
 
 /**************************** NF Chaining Types *******************************/
@@ -257,6 +261,21 @@ struct afxdp_nf;  /* forward declaration */
 typedef int (*afxdp_nf_handler_fn)(struct afxdp_pkt_holder *pkt,
                                    struct afxdp_nf *nf);
 
+/* Setup: called once when the NF thread starts (optional). */
+typedef int (*afxdp_nf_setup_fn)(struct afxdp_nf *nf);
+
+/* Teardown: called once when the NF thread exits (optional). */
+typedef void (*afxdp_nf_teardown_fn)(struct afxdp_nf *nf);
+
+/*
+ * NF function table — groups all callbacks for an NF type.
+ */
+struct afxdp_nf_function_table {
+        afxdp_nf_handler_fn   pkt_handler;    /* required */
+        afxdp_nf_setup_fn     setup;          /* optional, NULL = noop */
+        afxdp_nf_teardown_fn  teardown;       /* optional, NULL = noop */
+};
+
 /*
  * NF instance — represents one network function in the chain.
  */
@@ -272,8 +291,17 @@ struct afxdp_nf {
         void *rx_ring;                            /* struct rte_ring * */
         void *tx_ring;                            /* struct rte_ring * */
 
-        /* NF handler callback */
+        /* NF handler callback (used by Custom SPSC inline path) */
         afxdp_nf_handler_fn handler;
+
+        /* Full function table (used by real NF threads) */
+        struct afxdp_nf_function_table *function_table;
+
+        /* UMEM buffer base — for raw packet data access */
+        void *packet_buffer;
+
+        /* NF-private state (e.g., firewall rules) */
+        void *nf_state;
 
         /* Per-NF stats */
         struct afxdp_nf_stats stats;
@@ -321,17 +349,11 @@ struct afxdp_chain_ctx {
         struct afxdp_pkt_holder *holder_pool;
         uint32_t holder_pool_size;
 
-        /* true when holder_pool is embedded in the UMEM hugepage buffer */
-        bool holder_pool_embedded;
-
-#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
         /* MPSC free-list for holders (rte_ring: multi-producer enqueue, single-consumer dequeue) */
         void *holder_free_ring;               /* struct rte_ring */
-#else
-        /* Simple free-list for holders (stack-based, safe because Custom mode is single-threaded) */
-        uint32_t *holder_free_stack;
-        uint32_t holder_free_count;
-#endif
+
+        /* true when holder_pool is embedded in the UMEM hugepage buffer */
+        bool holder_pool_embedded;
 
         /* Selected ring backend */
         enum afxdp_ring_backend ring_backend;
