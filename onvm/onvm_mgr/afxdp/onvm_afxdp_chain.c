@@ -57,26 +57,25 @@
 #include <string.h>
 #include <inttypes.h>
 
-#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
 #include <rte_ring.h>
-#endif
+
+_Static_assert(sizeof(struct afxdp_pkt_holder) == AFXDP_HOLDER_ELEMENT_SIZE,
+               "AFXDP_HOLDER_ELEMENT_SIZE must match sizeof(struct afxdp_pkt_holder)");
 
 /******************************* Holder Pool **********************************/
 
 struct afxdp_pkt_holder *
 afxdp_holder_alloc(struct afxdp_chain_ctx *chain) {
-        if (chain->holder_free_count == 0)
+        struct afxdp_pkt_holder *holder = NULL;
+        if (rte_ring_dequeue((struct rte_ring *)chain->holder_free_ring, (void **)&holder) != 0)
                 return NULL;
-
-        uint32_t idx = chain->holder_free_stack[--chain->holder_free_count];
-        return &chain->holder_pool[idx];
+        return holder;
 }
 
 void
 afxdp_holder_free(struct afxdp_chain_ctx *chain,
                   struct afxdp_pkt_holder *holder) {
-        uint32_t idx = (uint32_t)(holder - chain->holder_pool);
-        chain->holder_free_stack[chain->holder_free_count++] = idx;
+        rte_ring_enqueue((struct rte_ring *)chain->holder_free_ring, holder);
 }
 
 /******************************* Chain Init ************************************/
@@ -103,33 +102,55 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
         chain->ring_backend = AFXDP_DEFAULT_RING_BACKEND;
         chain->xsk = ctx->xsk_socket;
 
-        /* ---- Allocate packet holder pool ---- */
+        /* ---- Set up packet holder pool ---- */
         chain->holder_pool_size = AFXDP_PKT_HOLDER_POOL_SIZE;
-        chain->holder_pool = (struct afxdp_pkt_holder *)calloc(
-                chain->holder_pool_size, sizeof(struct afxdp_pkt_holder));
-        if (!chain->holder_pool) {
-                AFXDP_LOG_ERR("Chain init: failed to allocate holder pool (%u entries)",
-                              chain->holder_pool_size);
-                free(chain);
-                return -ENOMEM;
+
+        if (ctx->packet_buffer) {
+                /* Embed the holder pool in the tail of the hugepage buffer, right after the UMEM frames */
+                chain->holder_pool = (struct afxdp_pkt_holder *)((uint8_t *)ctx->packet_buffer + AFXDP_UMEM_TOTAL_BYTES);
+                chain->holder_pool_embedded = true;
+                memset(chain->holder_pool, 0, chain->holder_pool_size * sizeof(struct afxdp_pkt_holder));
+        } else {
+                /* Fallback to heap allocation */
+                chain->holder_pool = (struct afxdp_pkt_holder *)calloc(
+                        chain->holder_pool_size, sizeof(struct afxdp_pkt_holder));
+                if (!chain->holder_pool) {
+                        AFXDP_LOG_ERR("Chain init: failed to allocate holder pool (%u entries)",
+                                      chain->holder_pool_size);
+                        free(chain);
+                        return -ENOMEM;
+                }
+                chain->holder_pool_embedded = false;
         }
 
-        chain->holder_free_stack = (uint32_t *)calloc(
-                chain->holder_pool_size, sizeof(uint32_t));
-        if (!chain->holder_free_stack) {
-                AFXDP_LOG_ERR("Chain init: failed to allocate holder free stack");
-                free(chain->holder_pool);
-                free(chain);
-                return -ENOMEM;
+        /* Create rte_ring-based MPSC free-list.
+         * SC dequeue: only the RX thread calls afxdp_holder_alloc.
+         * MP enqueue: RX, TX, and NF threads all call afxdp_holder_free. */
+        {
+                /* rte_ring usable count = size - 1; double pool_size
+                 * to guarantee enough capacity for all holders. */
+                uint32_t ring_sz = chain->holder_pool_size * 2;
+                chain->holder_free_ring = rte_ring_create(
+                        "afxdp_holder_free", ring_sz,
+                        rte_socket_id(), RING_F_SC_DEQ);
+                if (!chain->holder_free_ring) {
+                        AFXDP_LOG_ERR("Chain init: failed to create holder free ring");
+                        if (!chain->holder_pool_embedded)
+                                free(chain->holder_pool);
+                        free(chain);
+                        return -ENOMEM;
+                }
         }
 
-        /* Populate free stack — all holders start as free */
+        /* Populate free ring — all holders start as free */
         for (uint32_t j = 0; j < chain->holder_pool_size; j++) {
-                chain->holder_free_stack[j] = j;
+                rte_ring_enqueue((struct rte_ring *)chain->holder_free_ring,
+                                 &chain->holder_pool[j]);
         }
-        chain->holder_free_count = chain->holder_pool_size;
 
-        AFXDP_LOG_INFO("Chain: holder pool allocated (%u holders, %lu bytes each)",
+        AFXDP_LOG_INFO("Chain: holder pool %s (%u holders, %lu bytes each)",
+                       chain->holder_pool_embedded
+                           ? "embedded in UMEM buffer" : "heap-allocated",
                        chain->holder_pool_size,
                        (unsigned long)sizeof(struct afxdp_pkt_holder));
 
@@ -231,8 +252,10 @@ fail_rings:
                         afxdp_ring_free(chain->nfs[j].tx_ring_custom);
                 }
         }
-        free(chain->holder_free_stack);
-        free(chain->holder_pool);
+        if (chain->holder_free_ring)
+                rte_ring_free((struct rte_ring *)chain->holder_free_ring);
+        if (!chain->holder_pool_embedded && chain->holder_pool)
+                free(chain->holder_pool);
         free(chain);
         return -ENOMEM;
 }
@@ -528,14 +551,14 @@ afxdp_chain_teardown(struct afxdp_manager_ctx *ctx) {
         }
 
         /* Free holder pool */
-        if (chain->holder_pool) {
+        if (chain->holder_free_ring) {
+                rte_ring_free((struct rte_ring *)chain->holder_free_ring);
+                chain->holder_free_ring = NULL;
+        }
+        if (chain->holder_pool && !chain->holder_pool_embedded) {
                 free(chain->holder_pool);
-                chain->holder_pool = NULL;
         }
-        if (chain->holder_free_stack) {
-                free(chain->holder_free_stack);
-                chain->holder_free_stack = NULL;
-        }
+        chain->holder_pool = NULL;
 
         free(chain);
         ctx->chain = NULL;

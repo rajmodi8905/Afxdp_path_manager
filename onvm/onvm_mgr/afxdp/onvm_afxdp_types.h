@@ -321,9 +321,17 @@ struct afxdp_chain_ctx {
         struct afxdp_pkt_holder *holder_pool;
         uint32_t holder_pool_size;
 
-        /* Simple free-list for holders (stack-based, like UMEM allocator) */
+        /* true when holder_pool is embedded in the UMEM hugepage buffer */
+        bool holder_pool_embedded;
+
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+        /* MPSC free-list for holders (rte_ring: multi-producer enqueue, single-consumer dequeue) */
+        void *holder_free_ring;               /* struct rte_ring */
+#else
+        /* Simple free-list for holders (stack-based, safe because Custom mode is single-threaded) */
         uint32_t *holder_free_stack;
         uint32_t holder_free_count;
+#endif
 
         /* Selected ring backend */
         enum afxdp_ring_backend ring_backend;

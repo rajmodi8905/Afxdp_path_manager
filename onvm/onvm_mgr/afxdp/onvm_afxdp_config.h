@@ -174,6 +174,12 @@
  * can have a holder wrapper. */
 #define AFXDP_PKT_HOLDER_POOL_SIZE   4096
 
+/* Size (bytes) of one afxdp_pkt_holder element. */
+#define AFXDP_HOLDER_ELEMENT_SIZE    24
+
+/* Total bytes for the embedded holder pool, appended after UMEM frames. */
+#define AFXDP_HOLDER_REGION_BYTES    ((uint64_t)AFXDP_PKT_HOLDER_POOL_SIZE * AFXDP_HOLDER_ELEMENT_SIZE)
+
 /* NF action constants — set by the NF handler callback in pkt_meta.action. */
 #define AFXDP_NF_ACTION_DROP         0   /* Drop the packet                */
 #define AFXDP_NF_ACTION_NEXT         1   /* Forward to next NF in chain    */
@@ -234,8 +240,13 @@
 /* Raw UMEM size: AFXDP_NUM_FRAMES frames of AFXDP_FRAME_SIZE each. */
 #define AFXDP_UMEM_TOTAL_BYTES       ((uint64_t)AFXDP_NUM_FRAMES * AFXDP_FRAME_SIZE)
 
-/* Actual mmap size — rounded up to the next 2 MiB boundary so the allocation covers whole hugepages and does not share a page with any other allocator (including DPDK). */
-#define AFXDP_UMEM_HUGEPAGE_ALIGNED (((AFXDP_UMEM_TOTAL_BYTES) + AFXDP_HUGEPAGE_SIZE - 1) & ~(AFXDP_HUGEPAGE_SIZE - 1))
+/* Full buffer size: UMEM frames + embedded holder pool. */
+#define AFXDP_BUFFER_TOTAL_BYTES     (AFXDP_UMEM_TOTAL_BYTES + AFXDP_HOLDER_REGION_BYTES)
+
+/* Actual mmap size — rounded up to the next 2 MiB boundary so the allocation
+ * covers whole hugepages. Includes both the kernel UMEM region and the
+ * userspace-only holder pool appended at the tail. */
+#define AFXDP_UMEM_HUGEPAGE_ALIGNED (((AFXDP_BUFFER_TOTAL_BYTES) + AFXDP_HUGEPAGE_SIZE - 1) & ~(AFXDP_HUGEPAGE_SIZE - 1))
 
 /* Maximum memory (MB per NUMA socket) that the DPDK EAL is permitted to claim from the hugepage pool.*/
 #define AFXDP_DPDK_SOCKET_MEM_MB     1792
