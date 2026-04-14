@@ -715,6 +715,7 @@ afxdp_preflight_checks(struct afxdp_config *cfg) {
 static struct afxdp_umem_info *
 afxdp_configure_umem(void *buffer, uint64_t size) {
         struct afxdp_umem_info *umem;
+        struct xsk_umem_config umem_cfg;
         int ret;
 
         umem = calloc(1, sizeof(*umem));
@@ -723,8 +724,15 @@ afxdp_configure_umem(void *buffer, uint64_t size) {
                 return NULL;
         }
 
+        memset(&umem_cfg, 0, sizeof(umem_cfg));
+        umem_cfg.fill_size = AFXDP_FILL_RING_SIZE;
+        umem_cfg.comp_size = AFXDP_COMP_RING_SIZE;
+        umem_cfg.frame_size = AFXDP_FRAME_SIZE;
+        umem_cfg.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM;
+        umem_cfg.flags = 0;
+
         ret = xsk_umem__create(&umem->umem, buffer, size,
-                               &umem->fq, &umem->cq, NULL);
+                               &umem->fq, &umem->cq, &umem_cfg);
         if (ret) {
                 AFXDP_LOG_ERR("xsk_umem__create failed: %s", strerror(-ret));
                 free(umem);
