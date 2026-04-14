@@ -65,7 +65,7 @@ endif
 # ---- AF_XDP MODE -----------------------------------------------------------
 ifeq ($(MODE),AFXDP)
 APP = onvm_mgr_afxdp
-SRCS-y := main.c afxdp/onvm_afxdp.c afxdp/onvm_afxdp_ring.c afxdp/onvm_afxdp_chain.c afxdp/nfs/afxdp_simple_forward.c
+SRCS-y := main.c afxdp/onvm_afxdp.c afxdp/onvm_afxdp_ring.c afxdp/onvm_afxdp_chain.c afxdp/onvm_afxdp_nf_registry.c afxdp/nfs/afxdp_simple_forward.c
 
 CFLAGS += -O2 -Wall -Wextra -DUSE_AFXDP -I$(ONVM_MGR_DIR)/afxdp
 LDFLAGS += -lxdp -lbpf -lelf -lz -lpthread
