@@ -986,47 +986,55 @@ afxdp_submit_egress(struct afxdp_manager_ctx *ctx,
                     uint32_t count) {
         struct afxdp_socket_info *xsk = ctx->xsk_socket;
         uint32_t tx_idx = 0;
-        uint32_t submitted = 0;
+        uint32_t to_submit;
         int ret;
 
         if (count == 0)
                 return 0;
 
-        ret = xsk_ring_prod__reserve(&xsk->tx, count, &tx_idx);
-        if (ret <= 0) {
-                /* TX ring full — free all holders AND their UMEM frames */
-                for (uint32_t i = 0; i < count; i++) {
-                        afxdp_free_umem_frame(xsk, holders[i]->desc.umem_addr);
-                        afxdp_holder_free(ctx->chain, holders[i]);
+        /*
+         * Check how many TX ring slots are actually free.
+         * xsk_prod_nb_free returns the number of available slots,
+         * so we cap our submission to that. This avoids the
+         * all-or-nothing behaviour of reserve(), where requesting
+         * more than available returns 0 and drops everything.
+         */
+        to_submit = xsk_prod_nb_free(&xsk->tx, count);
+        if (to_submit > count)
+                to_submit = count;
+
+        if (to_submit > 0) {
+                ret = xsk_ring_prod__reserve(&xsk->tx, to_submit, &tx_idx);
+                /* ret is guaranteed == to_submit since we checked availability */
+
+                for (uint32_t i = 0; i < (uint32_t)ret; i++) {
+                        struct afxdp_pkt_holder *h = holders[i];
+                        xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr =
+                                h->desc.umem_addr;
+                        xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len =
+                                h->desc.len;
+                        tx_idx++;
+
+                        xsk->stats.tx_bytes += h->desc.len;
+                        xsk->stats.tx_packets++;
+
+                        /* Return holder to pool (UMEM frame stays on TX ring
+                         * until kernel completes transmission via CQ). */
+                        afxdp_holder_free(ctx->chain, h);
                 }
-                return 0;
+
+                xsk_ring_prod__submit(&xsk->tx, (uint32_t)ret);
+                xsk->outstanding_tx += (uint32_t)ret;
+                to_submit = (uint32_t)ret;
         }
 
-        submitted = (uint32_t)ret;
-
-        for (uint32_t i = 0; i < submitted; i++) {
-                struct afxdp_pkt_holder *h = holders[i];
-                xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = h->desc.umem_addr;
-                xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len  = h->desc.len;
-                tx_idx++;
-
-                xsk->stats.tx_bytes += h->desc.len;
-                xsk->stats.tx_packets++;
-
-                /* Return holder to pool */
-                afxdp_holder_free(ctx->chain, h);
-        }
-
-        xsk_ring_prod__submit(&xsk->tx, submitted);
-        xsk->outstanding_tx += submitted;
-
-        /* Free remaining holders that didn't fit on TX ring */
-        for (uint32_t i = submitted; i < count; i++) {
+        /* Free remaining holders + UMEM frames that didn't fit */
+        for (uint32_t i = to_submit; i < count; i++) {
                 afxdp_free_umem_frame(xsk, holders[i]->desc.umem_addr);
                 afxdp_holder_free(ctx->chain, holders[i]);
         }
 
-        return submitted;
+        return to_submit;
 }
 
 /****************************************************************************
@@ -1286,10 +1294,25 @@ afxdp_tx_thread_main(void *arg) {
 #if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
                 uint16_t n;
 
+                /*
+                 * Drain completions FIRST before processing NFs.
+                 * This reclaims UMEM frames from the CQ, replenishing
+                 * the free pool so the RX thread can refill the Fill Ring.
+                 * Without this, frames accumulate on the TX/CQ rings and
+                 * starve the Fill Ring, causing the kernel to drop packets.
+                 */
+                afxdp_complete_tx(ctx->xsk_socket);
+
                 for (n = 0; n < chain->chain_length; n++) {
                         struct afxdp_nf *nf = &chain->nfs[chain->chain_order[n]];
                         struct afxdp_pkt_holder *batch[AFXDP_NF_RING_BURST];
                         unsigned dequeued, j;
+
+                        /* Per-NF egress batch: collect all egress packets
+                         * from this NF and submit them in one call. */
+                        struct afxdp_pkt_holder *egress[AFXDP_NF_RING_BURST];
+                        uint32_t egress_lens[AFXDP_NF_RING_BURST];
+                        uint32_t egress_count = 0;
 
                         if (!nf->active || !nf->tx_ring)
                                 continue;
@@ -1317,23 +1340,16 @@ afxdp_tx_thread_main(void *arg) {
                                                         afxdp_holder_free(chain, pkt);
                                                 }
                                         } else {
-                                                /* Last NF — treat as OUT */
-                                                uint32_t sent = afxdp_submit_egress(ctx, &pkt, 1);
-                                                if (sent > 0) {
-                                                        nf->stats.tx_packets++;
-                                                        nf->stats.tx_bytes += pkt->desc.len;
-                                                }
+                                                /* Last NF — collect for batch egress */
+                                                egress_lens[egress_count] = pkt->desc.len;
+                                                egress[egress_count++] = pkt;
                                         }
                                         break;
                                 }
-                                case AFXDP_NF_ACTION_OUT: {
-                                        uint32_t sent = afxdp_submit_egress(ctx, &pkt, 1);
-                                        if (sent > 0) {
-                                                nf->stats.tx_packets++;
-                                                nf->stats.tx_bytes += pkt->desc.len;
-                                        }
+                                case AFXDP_NF_ACTION_OUT:
+                                        egress_lens[egress_count] = pkt->desc.len;
+                                        egress[egress_count++] = pkt;
                                         break;
-                                }
 
                                 case AFXDP_NF_ACTION_TONF: {
                                         uint16_t dest = pkt->meta.destination;
@@ -1364,9 +1380,19 @@ afxdp_tx_thread_main(void *arg) {
                                         break;
                                 }
                         }
+
+                        /* Batch-submit all egress packets for this NF */
+                        if (egress_count > 0) {
+                                uint32_t sent = afxdp_submit_egress(
+                                        ctx, egress, egress_count);
+                                for (uint32_t k = 0; k < sent; k++) {
+                                        nf->stats.tx_packets++;
+                                        nf->stats.tx_bytes += egress_lens[k];
+                                }
+                        }
                 }
 
-                /* Complete any outstanding TX operations */
+                /* Drain completions again at end to keep CQ flowing */
                 afxdp_complete_tx(ctx->xsk_socket);
 #endif
         }
