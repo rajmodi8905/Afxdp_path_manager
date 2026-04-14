@@ -1001,13 +1001,21 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
         uint32_t idx_rx = 0, idx_fq = 0, idx_tx = 0;
         int ret;
 
-        /* Step 1: Check how many packets arrived on the RX ring */
+        /*
+         * Step 1: Drain TX completions FIRST.
+         * This reclaims UMEM frames from previously transmitted packets
+         * and frees TX ring slots before we try to enqueue new packets.
+         * Without this, the TX ring fills up and never recovers.
+         */
+        afxdp_complete_tx(xsk);
+
+        /* Step 2: Check how many packets arrived on the RX ring */
         rcvd = xsk_ring_cons__peek(&xsk->rx, AFXDP_RX_BATCH_SIZE, &idx_rx);
         if (!rcvd)
                 return;
 
         /*
-         * Step 2: Refill the Fill Ring.
+         * Step 3: Refill the Fill Ring.
          * We need to give the kernel empty UMEM frames to write the
          * next batch of incoming packets into. We push as many free
          * frames as we have available.
@@ -1030,15 +1038,22 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
         }
 
         /*
-         * Step 3: Batch TX — reserve all TX slots for this batch at once,
-         * then fill them, then submit once.  This eliminates per-packet
-         * submit overhead and minimises kernel wakeups.
+         * Step 4: Batch TX.
+         * Use xsk_prod_nb_free to determine how many TX ring slots are
+         * actually available, and only reserve that many.  This avoids
+         * the all-or-nothing behaviour of xsk_ring_prod__reserve which
+         * returns 0 when the requested count exceeds free slots —
+         * previously this caused us to drop the entire RX batch even
+         * when partial TX was possible.
          */
-        ret = xsk_ring_prod__reserve(&xsk->tx, rcvd, &idx_tx);
-        if (ret > 0) {
-                unsigned int tx_count = (unsigned int)ret;
+        unsigned int tx_avail = xsk_prod_nb_free(&xsk->tx, rcvd);
+        unsigned int to_tx = (tx_avail < rcvd) ? tx_avail : rcvd;
 
-                for (i = 0; i < tx_count; i++) {
+        if (to_tx > 0) {
+                ret = xsk_ring_prod__reserve(&xsk->tx, to_tx, &idx_tx);
+                /* ret is guaranteed == to_tx since we checked availability */
+
+                for (i = 0; i < to_tx; i++) {
                         uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
                         uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
 
@@ -1051,32 +1066,21 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
                 }
 
                 /* Submit the entire batch to the kernel in one shot */
-                xsk_ring_prod__submit(&xsk->tx, tx_count);
-                xsk->outstanding_tx += tx_count;
-
-                /* Free frames for any RX packets we could not TX */
-                for (; i < rcvd; i++) {
-                        uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
-                        uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
-                        afxdp_free_umem_frame(xsk, addr);
-                        xsk->stats.rx_bytes += len;
-                }
-        } else {
-                /* TX ring completely full — drop all received packets */
-                for (i = 0; i < rcvd; i++) {
-                        uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
-                        uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
-                        afxdp_free_umem_frame(xsk, addr);
-                        xsk->stats.rx_bytes += len;
-                }
+                xsk_ring_prod__submit(&xsk->tx, to_tx);
+                xsk->outstanding_tx += to_tx;
         }
 
-        /* Step 4: Release consumed RX entries back to the kernel */
+        /* Free frames for any RX packets we could not TX */
+        for (i = to_tx; i < rcvd; i++) {
+                uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
+                uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
+                afxdp_free_umem_frame(xsk, addr);
+                xsk->stats.rx_bytes += len;
+        }
+
+        /* Step 5: Release consumed RX entries back to the kernel */
         xsk_ring_cons__release(&xsk->rx, rcvd);
         xsk->stats.rx_packets += rcvd;
-
-        /* Step 5: Complete any outstanding TX operations */
-        afxdp_complete_tx(xsk);
 }
 
 /****************************************************************************
