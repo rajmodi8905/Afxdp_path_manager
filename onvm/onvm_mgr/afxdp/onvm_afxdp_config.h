@@ -54,7 +54,7 @@
 
 /* Number of UMEM frames available for packet storage.
  * Each frame holds exactly one packet. Must be a power of 2. */
-#define AFXDP_NUM_FRAMES         4096
+#define AFXDP_NUM_FRAMES         32768
 
 /* Size of each UMEM frame in bytes.
  * XSK_UMEM__DEFAULT_FRAME_SIZE is typically 4096 (one page). */
@@ -67,19 +67,19 @@
 
 /* Number of descriptors in the RX ring (consumer ring, kernel → user).
  * Larger values reduce the chance of packet drops under burst. */
-#define AFXDP_RX_RING_SIZE       XSK_RING_CONS__DEFAULT_NUM_DESCS
+#define AFXDP_RX_RING_SIZE       8192
 
 /* Number of descriptors in the TX ring (producer ring, user → kernel).
  * Should match or exceed the expected TX burst. */
-#define AFXDP_TX_RING_SIZE       XSK_RING_PROD__DEFAULT_NUM_DESCS
+#define AFXDP_TX_RING_SIZE       8192
 
 /* Number of descriptors in the Fill ring.
  * Used by userspace to provide empty buffers for the kernel to fill. */
-#define AFXDP_FILL_RING_SIZE     XSK_RING_PROD__DEFAULT_NUM_DESCS
+#define AFXDP_FILL_RING_SIZE     8192
 
 /* Number of descriptors in the Completion ring.
  * Used by the kernel to notify userspace that TX buffers are done. */
-#define AFXDP_COMP_RING_SIZE     XSK_RING_CONS__DEFAULT_NUM_DESCS
+#define AFXDP_COMP_RING_SIZE     8192
 
 /********************Batch Processing Configuration***************************/
 
