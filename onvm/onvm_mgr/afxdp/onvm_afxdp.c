@@ -993,8 +993,14 @@ afxdp_submit_egress(struct afxdp_manager_ctx *ctx,
                 return 0;
 
         ret = xsk_ring_prod__reserve(&xsk->tx, count, &tx_idx);
-        if (ret <= 0)
+        if (ret <= 0) {
+                /* TX ring full — free all holders AND their UMEM frames */
+                for (uint32_t i = 0; i < count; i++) {
+                        afxdp_free_umem_frame(xsk, holders[i]->desc.umem_addr);
+                        afxdp_holder_free(ctx->chain, holders[i]);
+                }
                 return 0;
+        }
 
         submitted = (uint32_t)ret;
 
@@ -1016,6 +1022,7 @@ afxdp_submit_egress(struct afxdp_manager_ctx *ctx,
 
         /* Free remaining holders that didn't fit on TX ring */
         for (uint32_t i = submitted; i < count; i++) {
+                afxdp_free_umem_frame(xsk, holders[i]->desc.umem_addr);
                 afxdp_holder_free(ctx->chain, holders[i]);
         }
 
@@ -1311,17 +1318,22 @@ afxdp_tx_thread_main(void *arg) {
                                                 }
                                         } else {
                                                 /* Last NF — treat as OUT */
-                                                afxdp_submit_egress(ctx, &pkt, 1);
+                                                uint32_t sent = afxdp_submit_egress(ctx, &pkt, 1);
+                                                if (sent > 0) {
+                                                        nf->stats.tx_packets++;
+                                                        nf->stats.tx_bytes += pkt->desc.len;
+                                                }
+                                        }
+                                        break;
+                                }
+                                case AFXDP_NF_ACTION_OUT: {
+                                        uint32_t sent = afxdp_submit_egress(ctx, &pkt, 1);
+                                        if (sent > 0) {
                                                 nf->stats.tx_packets++;
                                                 nf->stats.tx_bytes += pkt->desc.len;
                                         }
                                         break;
                                 }
-                                case AFXDP_NF_ACTION_OUT:
-                                        afxdp_submit_egress(ctx, &pkt, 1);
-                                        nf->stats.tx_packets++;
-                                        nf->stats.tx_bytes += pkt->desc.len;
-                                        break;
 
                                 case AFXDP_NF_ACTION_TONF: {
                                         uint16_t dest = pkt->meta.destination;
