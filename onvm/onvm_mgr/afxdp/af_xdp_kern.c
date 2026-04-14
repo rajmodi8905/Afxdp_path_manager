@@ -27,6 +27,13 @@
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+
+#ifndef bpf_htons
+#define bpf_htons(x) __builtin_bswap16(x)
+#endif
 
 /****************************************************************************
  *
@@ -96,36 +103,57 @@ struct {
 SEC("xdp")
 int xdp_sock_prog(struct xdp_md *ctx)
 {
+        void *data_end = (void *)(long)ctx->data_end;
+        void *data = (void *)(long)ctx->data;
+        struct ethhdr *eth = data;
+
+        /* 1. Boundary check for Ethernet header */
+        if ((void *)(eth + 1) > data_end)
+                return XDP_PASS;
+
+        /* 2. Pass ARP packets directly to the host network stack 
+         *    so the VM can respond to ARP requests. */
+        if (eth->h_proto == bpf_htons(ETH_P_ARP))
+                return XDP_PASS;
+
+        /* 3. Pass SSH traffic directly to the host network stack 
+         *    so your SSH connection is not broken. */
+        if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+                struct iphdr *iph = (struct iphdr *)(eth + 1);
+
+                /* Boundary check for IP header */
+                if ((void *)(iph + 1) > data_end)
+                        return XDP_PASS;
+
+                if (iph->protocol == IPPROTO_TCP) {
+                        /* Jump to TCP header (accounting for possible IP options) */
+                        struct tcphdr *tcph = (struct tcphdr *)((__u8 *)iph + (iph->ihl * 4));
+
+                        /* Boundary check for TCP header */
+                        if ((void *)(tcph + 1) > data_end)
+                                return XDP_PASS;
+
+                        /* If destination or source port is 22 (SSH) */
+                        if (tcph->dest == bpf_htons(22) || tcph->source == bpf_htons(22))
+                                return XDP_PASS;
+                }
+        }
+
+        /* ----- AF_XDP REDIRECT LOGIC ----- */
+
         /* Get the RX queue index this packet arrived on */
         int index = ctx->rx_queue_index;
 
-        /* Update per-queue packet counter (per-CPU, no lock needed) */
-        __u32 *pkt_count;
-        pkt_count = bpf_map_lookup_elem(&xdp_stats_map, &index);
+        /* Update per-queue packet counter */
+        __u32 *pkt_count = bpf_map_lookup_elem(&xdp_stats_map, &index);
         if (pkt_count) {
                 (*pkt_count)++;
         }
 
-        /*
-         * Check if there is an AF_XDP socket bound to this RX queue.
-         * A non-NULL lookup means the userspace manager has registered
-         * a socket for this queue in the XSKMAP.
-         *
-         * bpf_redirect_map() returns XDP_REDIRECT on success, which
-         * causes the kernel to place the packet descriptor directly
-         * into the AF_XDP socket's RX ring — bypassing the entire
-         * Linux network stack (sk_buff allocation, protocol parsing,
-         * netfilter, etc.).
-         */
+        /* Check if an AF_XDP socket exists for this queue */
         if (bpf_map_lookup_elem(&xsks_map, &index))
                 return bpf_redirect_map(&xsks_map, index, 0);
 
-        /*
-         * No AF_XDP socket for this queue.
-         * Let the packet continue through the normal kernel stack.
-         * This allows non-managed traffic (e.g. SSH, ARP) to still
-         * work even when the AF_XDP manager is running.
-         */
         return XDP_PASS;
 }
 
