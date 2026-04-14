@@ -1146,8 +1146,19 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
         xsk_ring_cons__release(&xsk->rx, rcvd);
         xsk->stats.rx_packets += rcvd;
 
-        /* Step 5: Complete any outstanding TX operations */
-        afxdp_complete_tx(xsk);
+        /*
+         * Step 5: Complete any outstanding TX operations.
+         * IMPORTANT: In RTE chain mode, the TX thread is the sole owner
+         * of the XSK TX ring and Completion Ring.  Calling complete_tx
+         * from BOTH the RX thread and the TX thread would race on the
+         * CQ consumer index and corrupt UMEM frame reclamation.
+         * We only call it here for legacy bounce mode or SPSC chain mode,
+         * where the RX thread is the only thread touching the XSK TX path.
+         */
+        if (!ctx->chain || (ctx->chain &&
+            ctx->chain->ring_backend != AFXDP_RING_BE_RTE)) {
+                afxdp_complete_tx(xsk);
+        }
 }
 
 /****************************************************************************
