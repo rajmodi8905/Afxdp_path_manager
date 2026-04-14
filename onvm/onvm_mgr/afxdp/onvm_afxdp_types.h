@@ -147,9 +147,14 @@ struct afxdp_socket_info {
         /* libxdp socket handle */
         struct xsk_socket *xsk;
 
-        /* UMEM frame free-list (stack-based allocator) */
-        uint64_t umem_frame_addr[AFXDP_NUM_FRAMES];
-        uint32_t umem_frame_free;
+        /* UMEM frame free-list.
+         * In multi-threaded chain mode, we use an rte_ring (MPSC) so that
+         * the TX thread, NF threads, and RX thread can all push/pop
+         * frames without data races.  The rte_ring stores uint64_t
+         * addresses cast to (void *). */
+        uint64_t umem_frame_addr[AFXDP_NUM_FRAMES]; /* init-time bootstrap only */
+        uint32_t umem_frame_free;                    /* init-time bootstrap only */
+        void *umem_frame_ring;                       /* struct rte_ring * (MPSC) */
 
         /* Outstanding TX descriptors not yet completed by the kernel */
         uint32_t outstanding_tx;

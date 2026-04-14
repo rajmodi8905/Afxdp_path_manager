@@ -65,6 +65,8 @@
 #include "onvm_afxdp.h"
 #include "onvm_afxdp_chain.h"
 
+#include <rte_ring.h>
+
 #include <sys/mman.h>    /* mmap, munmap, MAP_HUGETLB, MAP_ANONYMOUS */
 #include <sys/syscall.h> /* syscall, __NR_mbind                        */
 #include <sys/utsname.h> /* uname                                      */
@@ -756,28 +758,28 @@ afxdp_configure_umem(void *buffer, uint64_t size) {
 }
 
 /*
- * Allocate one UMEM frame from the free-list.
+ * Allocate one UMEM frame from the thread-safe free-list.
+ * Uses SC (single-consumer) dequeue — only the RX thread allocates.
  * Returns AFXDP_INVALID_UMEM_FRAME if pool is exhausted.
  */
 static uint64_t
 afxdp_alloc_umem_frame(struct afxdp_socket_info *xsk) {
-        uint64_t frame;
-
-        if (xsk->umem_frame_free == 0)
+        void *addr_ptr = NULL;
+        if (rte_ring_sc_dequeue((struct rte_ring *)xsk->umem_frame_ring,
+                                &addr_ptr) != 0)
                 return AFXDP_INVALID_UMEM_FRAME;
-
-        frame = xsk->umem_frame_addr[--xsk->umem_frame_free];
-        xsk->umem_frame_addr[xsk->umem_frame_free] = AFXDP_INVALID_UMEM_FRAME;
-        return frame;
+        return (uint64_t)(uintptr_t)addr_ptr;
 }
 
 /*
- * Return a UMEM frame to the free-list.
+ * Return a UMEM frame to the thread-safe free-list.
+ * Uses MP (multi-producer) enqueue — TX thread, NF threads, and
+ * RX thread can all call this safely without locking.
  */
 void
 afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame) {
-        assert(xsk->umem_frame_free < AFXDP_NUM_FRAMES);
-        xsk->umem_frame_addr[xsk->umem_frame_free++] = frame;
+        rte_ring_mp_enqueue((struct rte_ring *)xsk->umem_frame_ring,
+                            (void *)(uintptr_t)frame);
 }
 
 /*
@@ -785,7 +787,7 @@ afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame) {
  */
 static uint64_t
 afxdp_umem_free_frames(struct afxdp_socket_info *xsk) {
-        return xsk->umem_frame_free;
+        return rte_ring_count((struct rte_ring *)xsk->umem_frame_ring);
 }
 
 /****************************************************************************
@@ -862,10 +864,27 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx) {
                 AFXDP_LOG_INFO("Socket inserted into XSKMAP (fd=%d)", ctx->xsk_map_fd);
         }
 
-        /* Initialize UMEM frame allocator: all frames start as free */
-        for (i = 0; i < AFXDP_NUM_FRAMES; i++)
-                xsk_info->umem_frame_addr[i] = i * AFXDP_FRAME_SIZE;
-        xsk_info->umem_frame_free = AFXDP_NUM_FRAMES;
+        /* Initialize thread-safe UMEM frame allocator (rte_ring MPSC).
+         * Ring size must be power-of-2 and > NUM_FRAMES.
+         * RING_F_SC_DEQ: only the RX thread dequeues (alloc).
+         * Default (MP) enqueue: TX, NF, and RX threads can all free. */
+        {
+                uint32_t ring_sz = AFXDP_NUM_FRAMES * 2; /* power-of-2, fits all */
+                xsk_info->umem_frame_ring = rte_ring_create(
+                        "afxdp_umem_frames", ring_sz,
+                        rte_socket_id(), RING_F_SC_DEQ);
+                if (!xsk_info->umem_frame_ring) {
+                        AFXDP_LOG_ERR("Failed to create UMEM frame ring");
+                        xsk_socket__delete(xsk_info->xsk);
+                        free(xsk_info);
+                        return NULL;
+                }
+                for (i = 0; i < AFXDP_NUM_FRAMES; i++) {
+                        rte_ring_mp_enqueue(
+                                (struct rte_ring *)xsk_info->umem_frame_ring,
+                                (void *)(uintptr_t)(i * AFXDP_FRAME_SIZE));
+                }
+        }
 
         /*
          * Pre-populate the Fill Ring with empty buffers so the kernel
@@ -1918,6 +1937,8 @@ afxdp_cleanup(struct afxdp_manager_ctx *ctx, bool final_cleanup) {
 
         /* Delete the AF_XDP socket */
         if (ctx->xsk_socket) {
+                if (ctx->xsk_socket->umem_frame_ring)
+                        rte_ring_free((struct rte_ring *)ctx->xsk_socket->umem_frame_ring);
                 xsk_socket__delete(ctx->xsk_socket->xsk);
                 free(ctx->xsk_socket);
                 ctx->xsk_socket = NULL;
