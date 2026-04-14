@@ -998,7 +998,7 @@ static void
 afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
         struct afxdp_socket_info *xsk = ctx->xsk_socket;
         unsigned int rcvd, stock_frames, i;
-        uint32_t idx_rx = 0, idx_fq = 0;
+        uint32_t idx_rx = 0, idx_fq = 0, idx_tx = 0;
         int ret;
 
         /* Step 1: Check how many packets arrived on the RX ring */
@@ -1020,7 +1020,7 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
                 /* Retry until we get all the slots we asked for */
                 while (ret != (int)stock_frames) {
                         ret = xsk_ring_prod__reserve(&xsk->umem->fq,
-                                                     rcvd, &idx_fq);
+                                                     stock_frames, &idx_fq);
                 }
                 for (i = 0; i < stock_frames; i++) {
                         *xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =
@@ -1029,17 +1029,46 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
                 xsk_ring_prod__submit(&xsk->umem->fq, stock_frames);
         }
 
-        /* Step 3: Process each received packet */
-        for (i = 0; i < rcvd; i++) {
-                uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
-                uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
+        /*
+         * Step 3: Batch TX — reserve all TX slots for this batch at once,
+         * then fill them, then submit once.  This eliminates per-packet
+         * submit overhead and minimises kernel wakeups.
+         */
+        ret = xsk_ring_prod__reserve(&xsk->tx, rcvd, &idx_tx);
+        if (ret > 0) {
+                unsigned int tx_count = (unsigned int)ret;
 
-                if (!afxdp_process_packet(xsk, addr, len)) {
-                        /* Packet was not forwarded; return frame to pool */
-                        afxdp_free_umem_frame(xsk, addr);
+                for (i = 0; i < tx_count; i++) {
+                        uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
+                        uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
+
+                        xsk_ring_prod__tx_desc(&xsk->tx, idx_tx)->addr = addr;
+                        xsk_ring_prod__tx_desc(&xsk->tx, idx_tx++)->len  = len;
+
+                        xsk->stats.rx_bytes += len;
+                        xsk->stats.tx_bytes += len;
+                        xsk->stats.tx_packets++;
                 }
 
-                xsk->stats.rx_bytes += len;
+                /* Submit the entire batch to the kernel in one shot */
+                xsk_ring_prod__submit(&xsk->tx, tx_count);
+                xsk->outstanding_tx += tx_count;
+
+                /* Free frames for any RX packets we could not TX */
+                for (; i < rcvd; i++) {
+                        uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
+                        uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
+                        afxdp_free_umem_frame(xsk, addr);
+                        xsk->stats.rx_bytes += len;
+                }
+        } else {
+                /* TX ring completely full — drop all received packets */
+                for (i = 0; i < rcvd; i++) {
+                        uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
+                        uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
+                        afxdp_free_umem_frame(xsk, addr);
+                        xsk->stats.rx_bytes += len;
+                }
         }
 
         /* Step 4: Release consumed RX entries back to the kernel */
