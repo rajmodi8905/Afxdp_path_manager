@@ -171,7 +171,7 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
                         nf->rx_ring = rte_ring_create(ring_name,
                                         AFXDP_NF_RING_SIZE,
                                         rte_socket_id(),
-                                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+                                        RING_F_SC_DEQ);
                         if (!nf->rx_ring) {
                                 AFXDP_LOG_ERR("Chain init: rte_ring_create RX failed for NF %u", i);
                                 goto fail_rings;

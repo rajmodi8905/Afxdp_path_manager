@@ -958,6 +958,34 @@ afxdp_complete_tx(struct afxdp_socket_info *xsk) {
         }
 }
 
+/*
+ * Drain-only variant: reclaim UMEM frames from the CQ without
+ * issuing a sendto() syscall. Used at the top of the TX thread
+ * loop to free frames quickly so the RX thread can refill the
+ * Fill Ring. The kernel kick is done separately after egress.
+ */
+static void
+afxdp_drain_cq(struct afxdp_socket_info *xsk) {
+        unsigned int completed;
+        uint32_t idx_cq;
+
+        if (!xsk->outstanding_tx)
+                return;
+
+        completed = xsk_ring_cons__peek(&xsk->umem->cq,
+                                        AFXDP_COMP_RING_SIZE, &idx_cq);
+        if (completed > 0) {
+                for (unsigned int i = 0; i < completed; i++) {
+                        afxdp_free_umem_frame(
+                                xsk,
+                                *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++));
+                }
+                xsk_ring_cons__release(&xsk->umem->cq, completed);
+                xsk->outstanding_tx -= (completed < xsk->outstanding_tx)
+                        ? completed : xsk->outstanding_tx;
+        }
+}
+
 /****************************************************************************
  *
  *                      PACKET PROCESSING
@@ -1093,16 +1121,15 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
         if (stock_frames > 0) {
                 ret = xsk_ring_prod__reserve(&xsk->umem->fq,
                                              stock_frames, &idx_fq);
-                /* Retry until we get all the slots we asked for */
-                while (ret != (int)stock_frames) {
-                        ret = xsk_ring_prod__reserve(&xsk->umem->fq,
-                                                     stock_frames, &idx_fq);
+                /* Non-blocking: take what we can, don't spin-wait */
+                if (ret > 0) {
+                        stock_frames = (unsigned int)ret;
+                        for (i = 0; i < stock_frames; i++) {
+                                *xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =
+                                        afxdp_alloc_umem_frame(xsk);
+                        }
+                        xsk_ring_prod__submit(&xsk->umem->fq, stock_frames);
                 }
-                for (i = 0; i < stock_frames; i++) {
-                        *xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =
-                                afxdp_alloc_umem_frame(xsk);
-                }
-                xsk_ring_prod__submit(&xsk->umem->fq, stock_frames);
         }
 
         /* Step 3: Process each received packet */
@@ -1315,12 +1342,11 @@ afxdp_tx_thread_main(void *arg) {
 
                 /*
                  * Drain completions FIRST before processing NFs.
-                 * This reclaims UMEM frames from the CQ, replenishing
-                 * the free pool so the RX thread can refill the Fill Ring.
-                 * Without this, frames accumulate on the TX/CQ rings and
-                 * starve the Fill Ring, causing the kernel to drop packets.
+                 * Use drain-only (no sendto syscall) to quickly reclaim
+                 * UMEM frames from the CQ. The kernel kick is deferred
+                 * to after egress submission to avoid double-syscall.
                  */
-                afxdp_complete_tx(ctx->xsk_socket);
+                afxdp_drain_cq(ctx->xsk_socket);
 
                 for (n = 0; n < chain->chain_length; n++) {
                         struct afxdp_nf *nf = &chain->nfs[chain->chain_order[n]];
