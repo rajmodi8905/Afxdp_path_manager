@@ -67,19 +67,19 @@
 
 /* Number of descriptors in the RX ring (consumer ring, kernel → user).
  * Larger values reduce the chance of packet drops under burst. */
-#define AFXDP_RX_RING_SIZE       4096
+#define AFXDP_RX_RING_SIZE       8192
 
 /* Number of descriptors in the TX ring (producer ring, user → kernel).
  * Should match or exceed the expected TX burst. */
-#define AFXDP_TX_RING_SIZE       4096
+#define AFXDP_TX_RING_SIZE       8192
 
 /* Number of descriptors in the Fill ring.
  * Used by userspace to provide empty buffers for the kernel to fill. */
-#define AFXDP_FILL_RING_SIZE     4096
+#define AFXDP_FILL_RING_SIZE     8192
 
 /* Number of descriptors in the Completion ring.
  * Used by the kernel to notify userspace that TX buffers are done. */
-#define AFXDP_COMP_RING_SIZE     4096
+#define AFXDP_COMP_RING_SIZE     8192
 
 /********************Batch Processing Configuration***************************/
 
