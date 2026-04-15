@@ -1137,6 +1137,9 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
                 struct afxdp_chain_ctx *chain = ctx->chain;
                 struct afxdp_nf *first_nf = &chain->nfs[chain->chain_order[0]];
 
+                struct afxdp_pkt_holder *holder_batch[AFXDP_RX_BATCH_SIZE];
+                uint32_t valid_count = 0;
+
                 for (i = 0; i < rcvd; i++) {
                         uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
                         uint32_t len  = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
@@ -1156,26 +1159,34 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
                         holder->meta.destination = 0;
                         holder->meta.flags = 0;
 
+                        holder_batch[valid_count++] = holder;
+                        xsk->stats.rx_bytes += len;
+                }
+
+                /* Batch-enqueue all holders to NF0 in one atomic op */
+                if (valid_count > 0) {
+                        unsigned enqueued = 0;
                         if (chain->ring_backend == AFXDP_RING_BE_RTE) {
 #if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
-                                if (rte_ring_enqueue(
+                                enqueued = rte_ring_enqueue_burst(
                                         (struct rte_ring *)first_nf->rx_ring,
-                                        holder) != 0) {
-                                        afxdp_holder_free(chain, holder);
-                                        afxdp_free_umem_frame(xsk, addr);
-                                        xsk->stats.rx_dropped++;
-                                }
+                                        (void **)holder_batch, valid_count, NULL);
 #endif
                         } else {
-                                if (afxdp_ring_enqueue(first_nf->rx_ring_custom,
-                                                       holder) != 0) {
-                                        afxdp_holder_free(chain, holder);
-                                        afxdp_free_umem_frame(xsk, addr);
-                                        xsk->stats.rx_dropped++;
+                                /* Custom SPSC: enqueue one at a time (fallback) */
+                                for (unsigned k = 0; k < valid_count; k++) {
+                                        if (afxdp_ring_enqueue(first_nf->rx_ring_custom,
+                                                               holder_batch[k]) != 0)
+                                                break;
+                                        enqueued++;
                                 }
                         }
-
-                        xsk->stats.rx_bytes += len;
+                        /* Free holders/frames that didn't fit */
+                        for (unsigned k = enqueued; k < valid_count; k++) {
+                                afxdp_free_umem_frame(xsk, holder_batch[k]->desc.umem_addr);
+                                afxdp_holder_free(chain, holder_batch[k]);
+                                xsk->stats.rx_dropped++;
+                        }
                 }
 
                 /* In custom SPSC mode, run chain inline and submit egress.
@@ -1481,18 +1492,21 @@ afxdp_dummy_nf_thread(void *arg) {
 
                 for (j = 0; j < dequeued; j++) {
                         struct afxdp_pkt_holder *pkt = batch[j];
-
                         nf->stats.rx_packets++;
                         nf->stats.rx_bytes += pkt->desc.len;
-
                         pkt->meta.action = AFXDP_NF_ACTION_NEXT;
+                }
 
-                        if (rte_ring_enqueue(
-                                (struct rte_ring *)nf->tx_ring, pkt) != 0) {
+                if (dequeued > 0) {
+                        unsigned enqueued = rte_ring_enqueue_burst(
+                                (struct rte_ring *)nf->tx_ring,
+                                (void **)batch, dequeued, NULL);
+                        /* Free packets that didn't fit */
+                        for (j = enqueued; j < dequeued; j++) {
                                 nf->stats.dropped++;
                                 afxdp_free_umem_frame(chain->xsk,
-                                                      pkt->desc.umem_addr);
-                                afxdp_holder_free(chain, pkt);
+                                                      batch[j]->desc.umem_addr);
+                                afxdp_holder_free(chain, batch[j]);
                         }
                 }
 #endif

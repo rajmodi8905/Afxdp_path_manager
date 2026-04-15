@@ -85,10 +85,10 @@
 
 /* Maximum number of packets to process in a single RX batch.
  * Larger batch sizes amortize syscall and ring overhead but increase latency. */
-#define AFXDP_RX_BATCH_SIZE      64
+#define AFXDP_RX_BATCH_SIZE      256
 
 /* Maximum number of packets to process in a single TX batch. */
-#define AFXDP_TX_BATCH_SIZE      64
+#define AFXDP_TX_BATCH_SIZE      256
 
 /**********************Stats Configuration************************************/
 
@@ -164,10 +164,10 @@
 #define AFXDP_MAX_CHAIN_LENGTH       8
 
 /* Number of entries in each per-NF SPSC ring. Must be a power of 2. */
-#define AFXDP_NF_RING_SIZE           2048
+#define AFXDP_NF_RING_SIZE           8192
 
 /* Maximum burst size when dequeue-ing from an NF ring. */
-#define AFXDP_NF_RING_BURST          64
+#define AFXDP_NF_RING_BURST          256
 
 /* Total number of pre-allocated packet holders.
  * Should be >= AFXDP_NUM_FRAMES so every in-flight UMEM frame
