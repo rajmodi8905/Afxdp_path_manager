@@ -53,7 +53,6 @@
 
 #include "onvm_afxdp_chain.h"
 #include "onvm_afxdp_nf_registry.h"
-#include "nfs/afxdp_simple_forward.h"
 
 #include <string.h>
 #include <inttypes.h>
@@ -218,7 +217,10 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
                         }
                 }
 
-                nf->handler = afxdp_simple_forward_handler;
+                /* handler is set by the caller after afxdp_chain_init()
+                 * returns (e.g., afxdp_chain_init_from_spec assigns function_table
+                 * and nf->handler). */
+                nf->handler = NULL;
                 chain->chain_order[i] = i;
                 memset(&nf->stats, 0, sizeof(nf->stats));
 
@@ -287,14 +289,23 @@ afxdp_chain_rx_nf(struct afxdp_chain_ctx *chain, uint16_t nf_idx) {
                 nf->stats.rx_packets++;
                 nf->stats.rx_bytes += pkt->desc.len;
 
+                pkt->meta.chain_index = nf->chain_position;
+
                 /* Call the NF handler */
                 if (nf->handler) {
                         nf->handler(pkt, nf);
                 }
 
-                /* Enqueue to NF's own TX ring */
+                if (pkt->meta.action == AFXDP_NF_ACTION_DROP) {
+                        nf->stats.dropped++;
+                        afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
+                        afxdp_holder_free(chain, pkt);
+                        continue;
+                }
+
+                /* Enqueue to NF's own TX ring (non-DROP packets only) */
                 if (afxdp_ring_enqueue(nf->tx_ring_custom, pkt) != 0) {
-                        /* TX ring full — drop */
+                        /* TX ring full — drop due to back-pressure */
                         nf->stats.dropped++;
                         afxdp_free_umem_frame(chain->xsk, pkt->desc.umem_addr);
                         afxdp_holder_free(chain, pkt);
@@ -417,35 +428,27 @@ afxdp_chain_forward(struct afxdp_chain_ctx *chain,
                     struct afxdp_pkt_holder **egress_holders,
                     uint32_t max_egress) {
         uint32_t egress_count = 0;
-        uint16_t i, pass;
-        bool pending;
+        uint16_t i;
 
-        for (pass = 0; pass < chain->chain_length; pass++) {
-                /* RX side: run each NF handler, enqueue to TX ring */
-                for (i = 0; i < chain->chain_length; i++) {
-                        afxdp_chain_rx_nf(chain, chain->chain_order[i]);
-                }
+        /*
+         *   for each NF in chain order:
+         *     (a) dequeue from NF RX ring, call handler, enqueue to NF TX ring
+         *     (b) drain NF TX ring and route: ACTION_NEXT → next NF's RX ring,
+         *         ACTION_OUT → egress, ACTION_DROP → free
+         *
+         * With this layout, packets produced by NF[i] land in NF[i+1]'s RX ring
+         * in step (b), and step (a) of the very next iteration immediately picks
+         * them up.  The pipeline is fully drained in a single forward call.
+         */
+        for (i = 0; i < chain->chain_length; i++) {
+                uint16_t nf_id = chain->chain_order[i];
 
-                /* TX side: drain each NF's TX ring, route by action */
-                for (i = 0; i < chain->chain_length; i++) {
-                        egress_count = afxdp_chain_tx_nf(
-                                chain, chain->chain_order[i], egress_holders,
-                                max_egress, egress_count);
-                }
+                /* (a) Run this NF's handler; results go to its TX ring. */
+                afxdp_chain_rx_nf(chain, nf_id);
 
-                /* Check if any NF has pending RX work from cross-NF routing */
-                pending = false;
-                for (i = 0; i < chain->chain_length; i++) {
-                        uint16_t nf_id = chain->chain_order[i];
-                        if (chain->nfs[nf_id].active &&
-                            chain->nfs[nf_id].rx_ring_custom &&
-                            afxdp_ring_count(chain->nfs[nf_id].rx_ring_custom) > 0) {
-                                pending = true;
-                                break;
-                        }
-                }
-                if (!pending)
-                        break;
+                /* (b) Route TX ring output to the next NF or egress. */
+                egress_count = afxdp_chain_tx_nf(
+                        chain, nf_id, egress_holders, max_egress, egress_count);
         }
 
         return egress_count;

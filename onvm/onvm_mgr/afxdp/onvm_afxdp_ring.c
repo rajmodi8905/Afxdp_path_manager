@@ -115,7 +115,10 @@ afxdp_ring_free(struct afxdp_nf_ring *r) {
 
 int
 afxdp_ring_enqueue(struct afxdp_nf_ring *r, void *obj) {
-        uint32_t h = r->head;
+        /* use atomic relaxed load — producer is sole writer of head,
+         * so __ATOMIC_RELAXED is sufficient, but a plain load is UB on
+         * architectures with relaxed memory models (ARM, POWER, RISC-V). */
+        uint32_t h = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
         uint32_t next = (h + 1) & r->mask;
 
         /* Acquire-load tail to see latest consumer progress. */

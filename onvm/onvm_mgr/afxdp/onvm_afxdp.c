@@ -900,11 +900,23 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx) {
                 return NULL;
         }
 
-        for (i = 0; i < AFXDP_FILL_RING_SIZE; i++) {
-                *xsk_ring_prod__fill_addr(&xsk_info->umem->fq, idx++) =
-                        afxdp_alloc_umem_frame(xsk_info);
+        {
+
+                uint32_t bootstrap_count = 0;
+                for (i = 0; i < AFXDP_FILL_RING_SIZE; i++) {
+                        uint64_t frame = afxdp_alloc_umem_frame(xsk_info);
+                        if (frame == AFXDP_INVALID_UMEM_FRAME) {
+                                AFXDP_LOG_ERR("UMEM pool exhausted during fill-ring "
+                                              "bootstrap after %u of %u frames — "
+                                              "kernel will have fewer pre-filled buffers",
+                                              i, AFXDP_FILL_RING_SIZE);
+                                break;
+                        }
+                        *xsk_ring_prod__fill_addr(&xsk_info->umem->fq, idx++) = frame;
+                        bootstrap_count++;
+                }
+                xsk_ring_prod__submit(&xsk_info->umem->fq, bootstrap_count);
         }
-        xsk_ring_prod__submit(&xsk_info->umem->fq, AFXDP_FILL_RING_SIZE);
 
         AFXDP_LOG_INFO("AF_XDP socket created on %s queue %d",
                        cfg->ifname, cfg->xsk_if_queue);
@@ -1040,7 +1052,8 @@ afxdp_submit_egress(struct afxdp_manager_ctx *ctx,
         int retries = 0;
         const int MAX_RETRIES = 8;
 
-        if (count == 0)
+
+        if (!ctx->chain || count == 0)
                 return 0;
 
         while (remaining > 0 && retries < MAX_RETRIES) {
@@ -1137,12 +1150,18 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
                                              stock_frames, &idx_fq);
                 /* Non-blocking: take what we can, don't spin-wait */
                 if (ret > 0) {
+
+                        unsigned int submitted = 0;
                         stock_frames = (unsigned int)ret;
                         for (i = 0; i < stock_frames; i++) {
-                                *xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =
-                                        afxdp_alloc_umem_frame(xsk);
+                                uint64_t frame = afxdp_alloc_umem_frame(xsk);
+                                if (frame == AFXDP_INVALID_UMEM_FRAME)
+                                        break;
+                                *xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = frame;
+                                submitted++;
                         }
-                        xsk_ring_prod__submit(&xsk->umem->fq, stock_frames);
+                        if (submitted > 0)
+                                xsk_ring_prod__submit(&xsk->umem->fq, submitted);
                 }
         }
 
@@ -1553,8 +1572,17 @@ afxdp_real_nf_thread(void *arg) {
 
         AFXDP_LOG_INFO("Real NF %u thread started", nf->nf_id);
 
+        if (!nf->function_table || !nf->function_table->pkt_handler) {
+                AFXDP_LOG_ERR("Real NF %u has no function_table — chain was not "
+                              "initialised via afxdp_chain_init_from_spec(). "
+                              "Exiting NF thread to avoid silent pass-through.",
+                              nf->nf_id);
+                free(nf_arg);
+                return NULL;
+        }
+
         /* Call NF setup if provided */
-        if (nf->function_table && nf->function_table->setup)
+        if (nf->function_table->setup)
                 nf->function_table->setup(nf);
 
         while (!ctx->global_exit) {
@@ -1590,7 +1618,7 @@ afxdp_real_nf_thread(void *arg) {
         }
 
         /* Call NF teardown if provided */
-        if (nf->function_table && nf->function_table->teardown)
+        if (nf->function_table->teardown)
                 nf->function_table->teardown(nf);
 
         AFXDP_LOG_INFO("Real NF %u thread exited", nf->nf_id);
@@ -1689,11 +1717,18 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 return err;
         }
 
-        /* ---- Step 3: Install signal handlers ---- */
+        /* ---- Step 3: Raise RLIMIT_MEMLOCK ---- */
+        if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
+                AFXDP_LOG_ERR("setrlimit(RLIMIT_MEMLOCK) failed: %s",
+                              strerror(errno));
+                return -errno;
+        }
+
+        /* ---- Step 4: Install signal handlers ---- */
         signal(SIGINT, afxdp_signal_handler);
         signal(SIGTERM, afxdp_signal_handler);
 
-        /* ---- Step 4: Load and attach the XDP kernel program ---- */
+        /* ---- Step 5: Load and attach the XDP kernel program ---- */
         AFXDP_LOG_INFO("Loading XDP program: %s (section: %s)",
                        ctx->cfg.xdp_obj_file, ctx->cfg.xdp_prog_name);
 
@@ -1732,13 +1767,6 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                         return -ENOENT;
                 }
                 AFXDP_LOG_INFO("Found xsks_map (fd=%d)", ctx->xsk_map_fd);
-        }
-
-        /* ---- Step 5: Raise RLIMIT_MEMLOCK ---- */
-        if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
-                AFXDP_LOG_ERR("setrlimit(RLIMIT_MEMLOCK) failed: %s",
-                              strerror(errno));
-                return -errno;
         }
 
         /* ---- Step 6: Adopt pre-allocated UMEM buffer or allocate now ---- */
@@ -1804,7 +1832,7 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 if (ctx->cfg.use_real_nfs) {
                         chain_err = afxdp_chain_init_from_spec(ctx, ctx->cfg.nf_chain_spec);
                 } else {
-                        chain_err = afxdp_chain_init(ctx, 2);
+                        chain_err = afxdp_chain_init(ctx, 1);
                 }
                 if (chain_err) {
                         AFXDP_LOG_ERR("NF chain initialization failed (err=%d)",
