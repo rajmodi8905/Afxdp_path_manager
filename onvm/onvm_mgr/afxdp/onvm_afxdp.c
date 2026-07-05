@@ -1352,10 +1352,25 @@ afxdp_stats_print(struct afxdp_stats_record *stats,
         printf("\n");
 }
 
+static void
+afxdp_set_thread_affinity(int core_id) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(core_id, &cpuset);
+        int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        if (rc != 0) {
+                AFXDP_LOG_WARN("Failed to set thread affinity to core %d (err: %s)",
+                               core_id, strerror(rc));
+        } else {
+                AFXDP_LOG_INFO("Thread pinned to core %d", core_id);
+        }
+}
+
 static void *
 afxdp_rx_thread_main(void *arg) {
         struct afxdp_manager_ctx *ctx = (struct afxdp_manager_ctx *)arg;
 
+        afxdp_set_thread_affinity(1);
         afxdp_rx_and_process(ctx);
         return NULL;
 }
@@ -1378,6 +1393,8 @@ afxdp_tx_thread_main(void *arg) {
                 AFXDP_LOG_WARN("TX thread: no chain context, exiting");
                 return NULL;
         }
+
+        afxdp_set_thread_affinity(2);
 
         AFXDP_LOG_INFO("TX thread started (NFs=%u)", chain->chain_length);
 
@@ -1518,6 +1535,8 @@ afxdp_dummy_nf_thread(void *arg) {
 
         AFXDP_LOG_INFO("Dummy NF %u thread started", nf->nf_id);
 
+        afxdp_set_thread_affinity(3 + nf_arg->nf_idx);
+
         while (!ctx->global_exit) {
 #if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
                 struct afxdp_pkt_holder *batch[AFXDP_NF_RING_BURST];
@@ -1572,6 +1591,8 @@ afxdp_real_nf_thread(void *arg) {
         struct afxdp_nf *nf = &chain->nfs[nf_arg->nf_idx];
 
         AFXDP_LOG_INFO("Real NF %u thread started", nf->nf_id);
+
+        afxdp_set_thread_affinity(3 + nf_arg->nf_idx);
 
         if (!nf->function_table || !nf->function_table->pkt_handler) {
                 AFXDP_LOG_ERR("Real NF %u has no function_table — chain was not "
