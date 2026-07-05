@@ -117,7 +117,8 @@ struct afxdp_stats_record {
         uint64_t rx_bytes;            /* Total RX bytes received */
         uint64_t tx_packets;          /* Total TX packets transmitted */
         uint64_t tx_bytes;            /* Total TX bytes transmitted */
-        uint64_t rx_dropped;          /* Packets dropped (no free UMEM frame) */
+        uint64_t rx_dropped;          /* Packets dropped on RX (no free UMEM frame / ring full) */
+        uint64_t tx_dropped;          /* Packets dropped on TX (XSK TX ring full) */
 };
 
 /**************************** XSK Socket Info *********************************/

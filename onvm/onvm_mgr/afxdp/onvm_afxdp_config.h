@@ -54,7 +54,7 @@
 
 /* Number of UMEM frames available for packet storage.
  * Each frame holds exactly one packet. Must be a power of 2. */
-#define AFXDP_NUM_FRAMES         16384
+#define AFXDP_NUM_FRAMES         65536
 
 /* Size of each UMEM frame in bytes.
  * XSK_UMEM__DEFAULT_FRAME_SIZE is typically 4096 (one page). */
@@ -169,10 +169,9 @@
 /* Maximum burst size when dequeue-ing from an NF ring. */
 #define AFXDP_NF_RING_BURST          256
 
-/* Total number of pre-allocated packet holders.
- * Should be >= AFXDP_NUM_FRAMES so every in-flight UMEM frame
- * can have a holder wrapper. */
-#define AFXDP_PKT_HOLDER_POOL_SIZE   16384
+/* Total number of packet holders available in the system.
+ * Should generally match AFXDP_NUM_FRAMES. */
+#define AFXDP_PKT_HOLDER_POOL_SIZE   65536
 
 /* Size (bytes) of one afxdp_pkt_holder element. */
 #define AFXDP_HOLDER_ELEMENT_SIZE    24

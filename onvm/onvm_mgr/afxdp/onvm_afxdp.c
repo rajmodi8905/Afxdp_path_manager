@@ -1104,6 +1104,7 @@ afxdp_submit_egress(struct afxdp_manager_ctx *ctx,
 
         /* Final drop: free any holders/frames that still couldn't be sent */
         for (uint32_t i = total_sent; i < count; i++) {
+                xsk->stats.tx_dropped++;
                 afxdp_free_umem_frame(xsk, holders[i]->desc.umem_addr);
                 afxdp_holder_free(ctx->chain, holders[i]);
         }
