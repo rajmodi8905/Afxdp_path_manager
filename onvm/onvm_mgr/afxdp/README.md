@@ -1,4 +1,4 @@
-# AF_XDP Manager - Comprehensive Guide
+# AF_XDP Manager
 
 ## Table of Contents
 1. [Overview](#overview)
@@ -15,43 +15,61 @@
 
 ## Overview
 
-The AF_XDP (Address Family XDP) manager is a high-performance, zero-copy packet I/O implementation for the openNetVM NF Manager. It replaces the traditional DPDK datapath with a Linux kernel-native AF_XDP socket interface, providing:
+The AF_XDP (Address Family XDP) manager is a high-performance packet I/O implementation for the openNetVM NF Manager. It replaces the traditional DPDK datapath with a Linux kernel-native AF_XDP socket interface, providing:
 
-- **Zero-copy packet processing** via shared UMEM (Unified Memory)
-- **Direct NIC-to-userspace packet transfer** bypassing the kernel network stack
+- **Direct NIC-to-userspace packet transfer** via shared UMEM, bypassing the kernel network stack
 - **XDP (eXpress Data Path)** eBPF program for packet steering at the NIC driver level
-- **Lower latency** and **reduced CPU overhead** compared to traditional kernel networking
+- **Decoupled multi-threaded pipeline**: dedicated RX, TX, and per-NF threads each pinned to their own CPU core
+- **Lock-free inter-thread communication** via DPDK `rte_ring` (MPSC) queues
+- **Hugepage-backed UMEM** for maximizing memory bus efficiency
 
 ### Key Concept
-The manager supports two modes:
+The manager is designed exclusively around the **Chained NF mode**, where packets flow through a pipeline of NF handlers before being transmitted back out. An optional legacy bounce mode exists purely for debugging the base AF_XDP socket path.
 
-1. **Legacy bounce mode**: packets received from the NIC via AF_XDP are immediately transmitted back — demonstrating the basic zero-copy datapath.
-2. **Chained NF mode** (default): packets flow through a chain of in-process NF handlers via lockfree SPSC rings before being transmitted back out.
+**End-to-End Chained NF Architecture Flow:**
+```
+        ┌─────────────────────────────────────────────────────────────────┐
+        │                     UMEM (Hugepage-backed)                      │
+        │            65536 frames × 4096 bytes = 256 MB total             │
+        └──────────────────────────────────────────────┬──────────────────┘
+                                                       │ zero-copy frame references
+  NIC                                      Kernel / Userspace Boundary
+  ───                                      ─────────────────────────────
+  [NIC RX Queue] ──→ [XDP eBPF Program] ──→ [AF_XDP RX Ring (8192)]
+                      (af_xdp_kern.o)                  │
+                                                       │ RX Thread (Core 1)
+                                                       │ afxdp_handle_receive()
+                                                       │ alloc pkt_holder
+                                                       ▼
+                                          [NF 0 RX rte_ring (8192)]
+                                                       │
+                                             NF 0 Thread (Core 3)
+                                             simple_forward → ACTION_NEXT
+                                                       │
+                                          [NF 0 TX rte_ring (8192)]
+                                                       │
+                                              TX Thread (Core 2)
+                                              routes to next NF
+                                                       │
+                                          [NF 1 RX rte_ring (8192)]
+                                                       │
+                                             NF 1 Thread (Core 4)
+                                             simple_forward → ACTION_NEXT
+                                                       │
+                                          [NF 1 TX rte_ring (8192)]
+                                                       │
+                                              TX Thread (Core 2)
+                                              afxdp_submit_egress()
+                                                       │
+                                            [AF_XDP TX Ring (8192)]
+                                                       │
+                                            [NIC TX] → back to wire
+```
 
-**Legacy Architecture Flow:**
-```
-NIC RX → XDP Prog (eBPF) → AF_XDP RX Ring → Userspace Processing → AF_XDP TX Ring → NIC TX
-         ↓                    ↓                                          ↓
-    Redirect to Socket    Zero-copy UMEM                          Zero-copy UMEM
-```
-
-**Chained NF Architecture Flow (Phase-1):**
-```
-NIC RX → XDP Prog → AF_XDP RX Ring
-  → Create afxdp_pkt_holder (UMEM desc + metadata)
-  → SPSC enqueue → NF0.rx_ring
-  → NF0 handler (simple_forward: set ACTION_NEXT)
-  → chain_forward routes → NF1.rx_ring
-  → NF1 handler (simple_forward: set ACTION_NEXT)
-  → Last NF: implicit ACTION_OUT
-  → afxdp_submit_egress → XSK TX Ring
-  → NIC TX
-```
-
-**Packet Holder Structure:**
+**Packet Holder Structure (metadata wrapper):**
 ```c
 struct afxdp_pkt_holder {
-    struct afxdp_nf_desc  desc;   // umem_addr + len
+    struct afxdp_nf_desc  desc;   // umem_addr (UMEM offset) + len
     struct afxdp_pkt_meta meta;   // action, chain_index, destination, flags
 };
 ```
@@ -62,64 +80,128 @@ struct afxdp_pkt_holder {
 
 ## Architecture
 
+### Threading Model
+
+The manager runs **6 concurrent threads** (for a 2-NF chain), each pinned to a dedicated CPU core using `pthread_setaffinity_np()`:
+
+| Thread | CPU Core | Role |
+|--------|----------|------|
+| **RX Thread** | Core 1 | Polls AF_XDP RX ring, allocates UMEM frames, wraps packets in `afxdp_pkt_holder`, enqueues to NF 0's RX ring |
+| **TX Thread** | Core 2 | Drains each NF's TX ring in chain order, routes by action, submits egress to AF_XDP TX ring, drains Completion ring |
+| **NF 0 Thread** | Core 3 | Dequeues from NF 0 RX ring, runs NF handler (`simple_forward`), enqueues to NF 0 TX ring |
+| **NF 1 Thread** | Core 4 | Dequeues from NF 1 RX ring, runs NF handler (`simple_forward`), enqueues to NF 1 TX ring |
+| **Manager Thread** | (floats) | Prints periodic statistics, handles TTL/pkt-limit shutdown |
+| **Wakeup Thread** | (floats) | Ensures graceful SIGINT/SIGTERM response even during busy-wait |
+
+Thread affinity is set immediately at thread startup (before the main loop), ensuring no scheduler migrations after initialization.
+
+### UMEM Architecture
+
+The UMEM is a single contiguous hugepage-backed memory region allocated via `mmap(MAP_HUGETLB)`:
+
+```
+ UMEM Buffer Layout (264192 KB total)
+ ┌──────────────────────────────────────────────────────┐
+ │  UMEM Frames                                         │
+ │  65536 × 4096 bytes = 262144 KB                      │
+ │  (each frame holds one packet, max MTU 4096 bytes)   │
+ ├──────────────────────────────────────────────────────┤
+ │  Holder Pool (embedded, tail of UMEM buffer)         │
+ │  65536 × 24 bytes = 1536 KB                          │
+ │  (one afxdp_pkt_holder metadata struct per frame)    │
+ └──────────────────────────────────────────────────────┘
+```
+
+**Frame Allocator**: A thread-safe DPDK `rte_ring` (`RING_F_SC_DEQ`) free-list stores UMEM frame addresses. Only the RX thread dequeues (single-consumer); both the RX thread and TX thread enqueue freed frames back (multi-producer).
+
+**Holder Pool Free-list**: Also a `rte_ring` (`RING_F_SC_DEQ`) — the RX thread allocates holders; the TX thread and NF threads return them.
+
+### Inter-NF Ring Backend
+
+The default and actively used ring backend is **DPDK `rte_ring`** (`AFXDP_DEFAULT_RING_BACKEND = AFXDP_RING_BACKEND_RTE`). Each NF has two dedicated `rte_ring` queues:
+
+- **`nf<N>_rx`** (`RING_F_SC_DEQ`): Single-consumer (the NF thread dequeues)
+- **`nf<N>_tx`** (`RING_F_SC_DEQ | RING_F_SP_ENQ`): The NF thread enqueues; the TX thread dequeues
+
+A custom lockfree SPSC ring implementation exists in `onvm_afxdp_ring.h/c` as a fallback (`AFXDP_RING_BACKEND_CUSTOM`), but is not used in the default production configuration.
+
+### AF_XDP Ring Structure (Kernel ↔ Userspace)
+
+Four rings form the kernel-userspace interface per AF_XDP socket:
+
+| Ring | Direction | Purpose |
+|------|-----------|---------|
+| **Fill Ring** | User → Kernel | Userspace provides empty UMEM frames for the kernel to fill with received packets |
+| **RX Ring** | Kernel → User | Kernel deposits received packet descriptors here |
+| **TX Ring** | User → Kernel | Userspace deposits outgoing packet descriptors here |
+| **Completion Ring** | Kernel → User | Kernel notifies userspace when TX frames have been transmitted |
+
+All four rings are sized at **8192** descriptors.
+
 ### Components
 
 1. **XDP Kernel Program (`af_xdp_kern.c`)**
    - eBPF program loaded onto the NIC's XDP hook
-   - Inspects RX queue index and redirects packets to AF_XDP sockets
-   - Maintains per-queue packet statistics
-   - Runs in kernel context with minimal overhead
+   - Inspects RX queue index and redirects packets to the registered AF_XDP socket via `bpf_redirect_map()`
+   - Falls through to `XDP_PASS` if no socket is registered for a given queue
 
 2. **Userspace Manager (`onvm_afxdp.c`)**
-   - Configures UMEM (shared packet buffer)
-   - Creates and manages AF_XDP sockets
-   - Implements RX/TX polling loops
-   - Handles packet processing and frame allocation
+   - Configures UMEM (hugepage-backed shared packet buffer)
+   - Creates and manages AF_XDP sockets and all four rings
+   - Launches and coordinates all worker threads
+   - Implements the RX polling loop (`afxdp_handle_receive`) and TX egress path (`afxdp_submit_egress`)
 
-3. **Type Definitions (`onvm_afxdp_types.h`)**
-   - Data structures for UMEM, sockets, stats, and configuration
-   - Complete type system for the AF_XDP implementation
+3. **Chain Manager (`onvm_afxdp_chain.h/c`)**
+   - Initializes per-NF `rte_ring` queues and the holder pool
+   - Loads NF handlers from the NF registry by name string (e.g., `"simple_forward"`)
+   - Manages chain teardown
 
-4. **Configuration (`onvm_afxdp_config.h`)**
-   - Tunable parameters (ring sizes, batch sizes, timeouts)
-   - Default values and macros
+4. **NF Registry (`onvm_afxdp_nf_registry.h/c`)**
+   - Maintains a table of registered NF types by name
+   - `afxdp_chain_init_from_spec("simple_forward,simple_forward", ...)` looks up handlers here
+
+5. **Type Definitions (`onvm_afxdp_types.h`)**
+   - Data structures for UMEM, sockets, stats, configuration, NF chain, and packet holders
+
+6. **Configuration (`onvm_afxdp_config.h`)**
+   - All tunable parameters (ring sizes, UMEM frames, batch sizes, thread counts, etc.)
 
 ### Key Data Structures
 
-#### UMEM (Unified Memory)
+#### UMEM
 ```c
 struct afxdp_umem_info {
-    struct xsk_ring_prod fq;      // Fill ring (user → kernel)
-    struct xsk_ring_cons cq;      // Completion ring (kernel → user)
+    struct xsk_ring_prod fq;      // Fill ring  (user → kernel: empty frames)
+    struct xsk_ring_cons cq;      // Completion ring (kernel → user: done TX frames)
     struct xsk_umem *umem;        // libxdp UMEM handle
-    void *buffer;                 // Raw mmap'd memory region
+    void *buffer;                 // Raw mmap(MAP_HUGETLB) memory region
 };
 ```
 
 #### XSK Socket
 ```c
 struct afxdp_socket_info {
-    struct xsk_ring_cons rx;              // RX ring (kernel → user)
-    struct xsk_ring_prod tx;              // TX ring (user → kernel)
-    struct afxdp_umem_info *umem;         // Shared UMEM reference
-    struct xsk_socket *xsk;               // libxdp socket handle
-    uint64_t umem_frame_addr[NUM];        // Free-list allocator
-    uint32_t umem_frame_free;             // Count of free frames
-    uint32_t outstanding_tx;              // Pending TX completions
-    struct afxdp_stats_record stats;      // Live statistics
+    struct xsk_ring_cons rx;         // RX ring (kernel → user)
+    struct xsk_ring_prod tx;         // TX ring (user → kernel)
+    struct afxdp_umem_info *umem;    // Shared UMEM reference
+    struct xsk_socket *xsk;          // libxdp socket handle
+    struct rte_ring *umem_frame_ring;// Thread-safe UMEM frame free-list (rte_ring)
+    uint32_t outstanding_tx;         // Pending TX completions
+    struct afxdp_stats_record stats; // Live statistics (rx_pkts, tx_pkts, rx_dropped, tx_dropped)
 };
 ```
 
 #### Manager Context
 ```c
 struct afxdp_manager_ctx {
-    struct afxdp_config cfg;              // Runtime configuration
+    struct afxdp_config cfg;              // Runtime configuration (parsed from CLI)
     struct afxdp_umem_info *umem;         // UMEM region
-    struct afxdp_socket_info *xsk_socket; // Primary socket
+    struct afxdp_socket_info *xsk_socket; // Primary AF_XDP socket
     struct xdp_program *xdp_prog;         // XDP program handle
     int xsk_map_fd;                       // XSKMAP file descriptor
-    pthread_t stats_thread;               // Statistics thread
-    volatile bool global_exit;            // Shutdown flag
+    struct afxdp_chain_ctx *chain;        // NF chain context (rings, holders, NF threads)
+    volatile bool global_exit;            // Shutdown flag (set by SIGINT/SIGTERM)
+    bool hugepage_preallocated;           // Whether UMEM buffer was pre-allocated
 };
 ```
 
@@ -128,36 +210,33 @@ struct afxdp_manager_ctx {
 ## Dependencies
 
 ### System Requirements
-- **Linux Kernel**: >= 5.3 (recommended >= 5.11 for better AF_XDP support)
-- **CPU**: x86_64 architecture with XDP-capable NIC
-- **NIC**: Network card with XDP support (native mode recommended)
+- **Linux Kernel**: >= 5.3 (recommended >= 5.11 for improved AF_XDP support)
+- **CPU**: x86_64 with at least 5 available CPU cores (1 per datapath thread + OS)
+- **RAM**: >= 1 GB hugepages configured (150 × 2MB pages recommended for testing)
+- **NIC**: Any XDP-capable NIC; `virtio_net` works via XDP generic/copy mode
 
 ### Required Libraries
 
-1. **libbpf** (>= 0.3.0)
+1. **DPDK** (>= 21.x)
+   - Required for `rte_ring`, `rte_eal`, and hugepage management
+   - Build DPDK and export `RTE_SDK` and `RTE_TARGET`
+
+2. **libbpf** (>= 0.3.0)
    - BPF program loading and management
    - Install: `sudo apt-get install libbpf-dev`
 
-2. **libxdp** (>= 1.0.0)
+3. **libxdp** (>= 1.0.0)
    - High-level AF_XDP socket API
    - Install: `sudo apt-get install libxdp-dev`
    - Source: https://github.com/xdp-project/xdp-tools
 
-3. **Linux Kernel Headers**
+4. **Linux Kernel Headers**
    - Required for BPF and XDP definitions
    - Install: `sudo apt-get install linux-headers-$(uname -r)`
 
-4. **clang** (>= 10.0)
-   - BPF bytecode compiler
+5. **clang** (>= 10.0)
+   - BPF bytecode compiler for `af_xdp_kern.c`
    - Install: `sudo apt-get install clang llvm`
-
-5. **Standard Libraries**
-   - pthread (POSIX threads)
-   - Standard C library (glibc)
-
-### Optional Dependencies
-- **bpftool**: For BPF map inspection and debugging
-  - Install: `sudo apt-get install linux-tools-common linux-tools-generic`
 
 ### Kernel Configuration
 Ensure the following kernel config options are enabled:
@@ -166,11 +245,12 @@ CONFIG_BPF=y
 CONFIG_BPF_SYSCALL=y
 CONFIG_XDP_SOCKETS=y
 CONFIG_BPF_JIT=y
+CONFIG_HUGETLBFS=y
 ```
 
 Verify with:
 ```bash
-zgrep -E 'CONFIG_BPF|CONFIG_XDP' /proc/config.gz
+zgrep -E 'CONFIG_BPF|CONFIG_XDP|CONFIG_HUGE' /proc/config.gz
 ```
 
 ---
@@ -181,42 +261,35 @@ zgrep -E 'CONFIG_BPF|CONFIG_XDP' /proc/config.gz
 
 | File | Purpose | Compiled |
 |------|---------|----------|
-| `af_xdp_kern.c` | XDP eBPF kernel program | Yes (BPF bytecode) |
-| `onvm_afxdp.c` | Main AF_XDP manager + chained datapath | Yes (userspace) |
+| `af_xdp_kern.c` | XDP eBPF kernel program (packet steering) | Yes (BPF bytecode) |
+| `onvm_afxdp.c` | Main AF_XDP manager: UMEM, sockets, RX/TX loops, thread launch | Yes (userspace) |
 | `onvm_afxdp.h` | Public API declarations | No (header) |
-| `onvm_afxdp_types.h` | Type definitions (UMEM, sockets, NF chain types) | No (header) |
-| `onvm_afxdp_config.h` | Config constants (ring sizes, NF actions, chain params) | No (header) |
-| `onvm_afxdp_ring.h/c` | Lockfree SPSC ring (rte_ring-compatible API) | Yes (userspace) |
-| `onvm_afxdp_chain.h/c` | NF chain management (init, forward, teardown) | Yes (userspace) |
-| `nfs/afxdp_simple_forward.h/c` | Simple forward NF (pass-through, sets ACTION_NEXT) | Yes (userspace) |
-| `Makefile` | Build script for XDP kernel program | No |
+| `onvm_afxdp_types.h` | Type definitions (UMEM, sockets, chain, stats) | No (header) |
+| `onvm_afxdp_config.h` | All tunable constants (ring sizes, pool sizes, thread counts) | No (header) |
+| `onvm_afxdp_ring.h/c` | Custom lockfree SPSC ring (backup; not used by default) | Yes (userspace) |
+| `onvm_afxdp_chain.h/c` | NF chain management (ring init, packet routing, teardown) | Yes (userspace) |
+| `onvm_afxdp_nf_registry.h/c` | NF type registry (maps name string → handler struct) | Yes (userspace) |
+| `nfs/afxdp_simple_forward.h/c` | `simple_forward` NF: sets `ACTION_NEXT` on every packet | Yes (userspace) |
+| `Makefile` | Builds `af_xdp_kern.o` (eBPF bytecode) | No |
 
 ### Workflow by File
 
 #### 1. `af_xdp_kern.c` - XDP Kernel Program
 
-**Purpose**: Packet steering at the NIC driver level
-
-**Workflow**:
+**Workflow:**
 ```
 1. Packet arrives at NIC
 2. NIC driver invokes XDP hook
 3. xdp_sock_prog(ctx) is called with packet context
 4. Extract RX queue index from ctx->rx_queue_index
-5. Update per-queue packet counter in xdp_stats_map
-6. Lookup socket FD in xsks_map[queue_index]
-7. If socket exists:
-   → bpf_redirect_map() to AF_XDP socket (zero-copy to userspace)
-8. Else:
+5. Lookup socket FD in xsks_map[queue_index]
+6. If socket exists:
+   → bpf_redirect_map() → AF_XDP socket (packet deposited in RX ring)
+7. Else:
    → XDP_PASS (continue to normal kernel stack)
 ```
 
-**Key Functions**:
-- `xdp_sock_prog()`: Main entry point (executed per packet)
-- `bpf_redirect_map()`: BPF helper to redirect packet to AF_XDP socket
-- `bpf_map_lookup_elem()`: Check if socket registered for queue
-
-**BPF Maps**:
+**BPF Maps:**
 ```c
 // XSKMAP: RX queue index → AF_XDP socket fd
 xsks_map: BPF_MAP_TYPE_XSKMAP[64]
@@ -225,429 +298,103 @@ xsks_map: BPF_MAP_TYPE_XSKMAP[64]
 xdp_stats_map: BPF_MAP_TYPE_PERCPU_ARRAY[64]
 ```
 
-**Compilation**: Compiled to BPF bytecode (.o file) by clang with `-target bpf`
-
 ---
 
 #### 2. `onvm_afxdp.c` - Userspace Manager
 
-**Purpose**: Main packet processing engine in userspace
-
-**Initialization Workflow** (`afxdp_init`):
+**Initialization Workflow (`afxdp_init`):**
 ```
-1. Parse command-line arguments (interface, queue, XDP mode)
-2. Install signal handlers (SIGINT, SIGTERM)
-3. Load XDP kernel program from af_xdp_kern.o
-4. Attach XDP program to network interface
-5. Find and open xsks_map BPF map
-6. Raise RLIMIT_MEMLOCK for UMEM registration
-7. Allocate UMEM packet buffer (NUM_FRAMES × FRAME_SIZE)
-8. Configure UMEM with Fill/Completion rings
-9. Create AF_XDP socket bound to (interface, queue)
+1.  Parse CLI arguments (interface, queue, XDP mode, NF chain spec)
+2.  Install signal handlers (SIGINT, SIGTERM → set global_exit)
+3.  Pre-allocate UMEM hugepage buffer via mmap(MAP_HUGETLB)
+4.  Initialize DPDK EAL (rte_eal_init) for rte_ring support
+5.  Load XDP kernel program from af_xdp_kern.o (libxdp)
+6.  Attach XDP program to network interface
+7.  Find and open xsks_map BPF map
+8.  Configure UMEM with Fill/Completion rings (xsk_umem__create)
+9.  Create AF_XDP socket bound to (interface, queue)
 10. Insert socket FD into xsks_map[queue]
-11. Initialize UMEM frame allocator (free-list)
+11. Initialize UMEM frame free-list (rte_ring)
 12. Pre-fill Fill ring with empty UMEM frames
-13. Start statistics thread (if verbose mode)
+13. Initialize NF chain (afxdp_chain_init_from_spec):
+    - Create per-NF rte_ring queues (rx_ring, tx_ring)
+    - Embed holder pool in tail of UMEM buffer
+    - Look up NF handlers from NF registry
+14. Launch all worker threads (with CPU core affinity):
+    - RX thread → Core 1
+    - TX thread → Core 2
+    - NF 0 thread → Core 3
+    - NF N thread → Core 3+N
+    - Manager/Stats thread
+    - Wakeup thread
 ```
 
-**Runtime Workflow** (`afxdp_run`):
+**RX Thread Runtime (`afxdp_handle_receive` — Core 1):**
 ```
-Main Loop (until global_exit):
-├─ Poll or busy-wait for RX packets
-├─ afxdp_handle_receive():
-│  ├─ Peek RX ring for received packet descriptors
-│  ├─ Refill Fill ring with free UMEM frames
-│  ├─ For each received packet:
-│  │  ├─ Get UMEM address and length from descriptor
-│  │  ├─ afxdp_process_packet():
-│  │  │  ├─ Reserve slot on TX ring
-│  │  │  ├─ Copy descriptor (addr, len) to TX ring
-│  │  │  ├─ Submit to kernel for transmission
-│  │  │  └─ Update TX stats
-│  │  └─ If TX fails → free UMEM frame
-│  ├─ Release consumed RX descriptors
-│  ├─ Update RX stats
-│  └─ afxdp_complete_tx():
-│     ├─ Kick kernel with sendto() to flush TX
-│     ├─ Peek Completion ring for done TX frames
-│     ├─ Reclaim UMEM frames to free-list
-│     └─ Update outstanding_tx counter
-└─ Check auto-shutdown conditions (TTL, packet limit)
+Per polling iteration:
+1. Peek XSK RX ring for arrived packet descriptors (burst up to 256)
+2. Refill Fill ring with free UMEM frames (from frame free-list)
+3. For each received packet descriptor:
+   a. Allocate one afxdp_pkt_holder from holder pool
+   b. Populate holder: desc.umem_addr, desc.len, meta.action = NEXT
+   c. rte_ring_enqueue() → NF 0's rx_ring
+   d. If ring full: free holder + UMEM frame (ingress drop, stats.rx_dropped++)
+4. xsk_ring_cons__release() on RX ring
+5. Update stats.rx_packets
 ```
 
-**Cleanup Workflow** (`afxdp_cleanup`):
+**TX Thread Runtime (`afxdp_tx_thread_main` — Core 2):**
 ```
-1. Join statistics thread
-2. Print final statistics
-3. Detach XDP program from interface
-4. Close XDP program handle
-5. Delete AF_XDP socket
-6. Delete UMEM region
-7. Free raw packet buffer
-```
-
-**UMEM Frame Allocator**:
-```c
-// Stack-based allocator (LIFO)
-afxdp_alloc_umem_frame():
-  - Pop frame address from umem_frame_addr[]
-  - Decrement umem_frame_free
-  - Return INVALID if pool exhausted
-
-afxdp_free_umem_frame(frame):
-  - Push frame address back to umem_frame_addr[]
-  - Increment umem_frame_free
+Per polling iteration:
+1. afxdp_drain_cq(): Drain Completion ring to reclaim TX UMEM frames (no syscall)
+2. For each NF in chain order:
+   a. rte_ring_dequeue_burst() up to 256 holders from nf<N>_tx
+   b. For each holder:
+      - ACTION_NEXT: route to next NF's rx_ring
+      - ACTION_OUT: collect in egress batch
+      - ACTION_DROP: free holder + UMEM frame
+3. afxdp_submit_egress(): Write egress batch to XSK TX ring
+4. sendto() syscall to kick kernel TX processing
+5. If TX ring full: retry with afxdp_complete_tx(); drop overflow (stats.tx_dropped++)
 ```
 
----
-
-#### 3. `onvm_afxdp.h` - Public API
-
-**Exports three main functions**:
-
-```c
-int afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv);
-int afxdp_run(struct afxdp_manager_ctx *ctx);
-void afxdp_cleanup(struct afxdp_manager_ctx *ctx);
+**NF Thread Runtime (Core 3+N):**
+```
+Per polling iteration:
+1. rte_ring_dequeue_burst() up to 256 holders from nf<N>_rx
+2. For each holder:
+   a. stats.rx_packets++, stats.rx_bytes += len
+   b. Call nf->function_table->pkt_handler(pkt, nf)
+      [simple_forward: sets pkt->meta.action = ACTION_NEXT]
+   c. rte_ring_enqueue() → nf<N>_tx
+   d. If TX ring full: stats.dropped++, free holder + UMEM frame
 ```
 
-**Integration Point**: Used by `onvm_mgr/main.c` when compiled with `-DUSE_AFXDP`
-
----
-
-#### 4. `onvm_afxdp_types.h` - Type Definitions
-
-**Contains**:
-- System and AF_XDP library includes
-- `afxdp_umem_info`: UMEM management structure
-- `afxdp_socket_info`: Socket state and rings
-- `afxdp_stats_record`: Per-socket statistics
-- `afxdp_config`: Runtime configuration from CLI
-- `afxdp_manager_ctx`: Top-level manager state
-
----
-
-#### 5. `onvm_afxdp_config.h` - Configuration
-
-**Tunable Parameters**:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `AFXDP_NUM_FRAMES` | 4096 | Total UMEM frames (must be power of 2) |
-| `AFXDP_FRAME_SIZE` | 4096 | Size per frame (1 page) |
-| `AFXDP_RX_RING_SIZE` | 2048 | RX descriptor ring size |
-| `AFXDP_TX_RING_SIZE` | 2048 | TX descriptor ring size |
-| `AFXDP_FILL_RING_SIZE` | 2048 | Fill ring size |
-| `AFXDP_COMP_RING_SIZE` | 2048 | Completion ring size |
-| `AFXDP_RX_BATCH_SIZE` | 64 | Max packets per RX batch |
-| `AFXDP_TX_BATCH_SIZE` | 64 | Max packets per TX batch |
-| `AFXDP_STATS_INTERVAL` | 2 | Seconds between stats output |
-| `AFXDP_MAX_SOCKETS` | 64 | Max sockets in XSKMAP |
-
-**Logging Macros**:
-```c
-AFXDP_LOG_INFO(fmt, ...)   // Stdout logging
-AFXDP_LOG_ERR(fmt, ...)    // Stderr error logging
-AFXDP_LOG_WARN(fmt, ...)   // Stderr warning logging
+**Cleanup Workflow:**
+```
+1. Set global_exit = true (signal threads to stop)
+2. Join all worker threads
+3. Print final NF chain statistics
+4. afxdp_chain_teardown(): destroy per-NF rte_rings
+5. Detach XDP program from interface
+6. xsk_socket__delete() + xsk_umem__delete()
+7. munmap() UMEM hugepage buffer
 ```
 
 ---
 
-## Function Reference
+#### 3. `onvm_afxdp_chain.h/c` - NF Chain Manager
 
-### Core API Functions
-
-#### `afxdp_init()`
-```c
-int afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv)
-```
-**Purpose**: Complete initialization of the AF_XDP manager
-
-**Parameters**:
-- `ctx`: Pointer to manager context (must be zeroed by caller)
-- `argc`, `argv`: Command-line arguments
-
-**Returns**: 0 on success, negative errno on failure
-
-**Steps**:
-1. Parse CLI arguments
-2. Install signal handlers
-3. Load and attach XDP program
-4. Configure UMEM
-5. Create AF_XDP socket
-6. Start stats thread
-
-**Error Handling**: Returns immediately on any initialization failure
+**Responsibilities:**
+- `afxdp_chain_init_from_spec("nf0,nf1", ctx)`: Parses chain spec string, looks up handlers in NF registry, creates per-NF `rte_ring` queues, embeds holder pool in UMEM buffer tail
+- Routes packets between NFs: TX thread calls chain logic to determine next hop based on `pkt->meta.action`
+- `afxdp_chain_teardown()`: Frees all ring resources
 
 ---
 
-#### `afxdp_run()`
-```c
-int afxdp_run(struct afxdp_manager_ctx *ctx)
-```
-**Purpose**: Enter the main packet processing loop
+#### 4. `onvm_afxdp_ring.h/c` - Custom SPSC Ring (Backup)
 
-**Parameters**:
-- `ctx`: Initialized manager context
-
-**Returns**: 0 on clean shutdown, negative errno on error
-
-**Behavior**:
-- Blocks until `ctx->global_exit` is set
-- Continuously polls RX ring and processes packets
-- Handles TX completions and UMEM frame recycling
-- Supports two modes:
-  - **Busy-wait**: Tight loop for lowest latency
-  - **Poll mode** (`-p`): Uses `poll()` syscall to save CPU
-
-**Exit Conditions**:
-- SIGINT/SIGTERM received
-- Time-to-live expired (`-t` flag)
-- Packet limit reached (`-l` flag)
-
----
-
-#### `afxdp_cleanup()`
-```c
-void afxdp_cleanup(struct afxdp_manager_ctx *ctx)
-```
-**Purpose**: Release all AF_XDP resources and cleanup
-
-**Parameters**:
-- `ctx`: Manager context to clean up
-
-**Actions**:
-1. Join stats thread
-2. Print final statistics
-3. Detach XDP program
-4. Delete socket and UMEM
-5. Free all allocated memory
-
----
-
-### Internal Functions
-
-#### Argument Parsing
-
-##### `afxdp_parse_args()`
-```c
-static void afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv)
-```
-**Purpose**: Parse command-line flags and populate configuration
-
-**Supported Options**:
-```
--d <ifname>     Network interface (required)
--Q <queue>      RX queue index (default: 0)
--S              SKB mode (generic XDP)
--N              Native mode (driver XDP)
--c              Force copy mode
--z              Force zero-copy mode
--p              Poll mode (use poll() instead of busy-wait)
--f <file.o>     Custom XDP kernel object
--P <section>    XDP program section name
--v              Verbose stats
--t <seconds>    Auto-shutdown after N seconds
--l <packets>    Auto-shutdown after N packets
--h              Show help
-```
-
-**Behavior**:
-- Resolves interface name to index via `if_nametoindex()`
-- Validates parameters
-- Sets defaults for unspecified options
-- Exits on invalid input
-
----
-
-#### UMEM Management
-
-##### `afxdp_configure_umem()`
-```c
-static struct afxdp_umem_info *afxdp_configure_umem(void *buffer, uint64_t size)
-```
-**Purpose**: Create UMEM region with Fill and Completion rings
-
-**Parameters**:
-- `buffer`: Pre-allocated memory region (page-aligned)
-- `size`: Total size in bytes
-
-**Returns**: Pointer to UMEM info struct, or NULL on failure
-
-**Internal Call**: `xsk_umem__create()` (libxdp)
-
----
-
-##### `afxdp_alloc_umem_frame()`
-```c
-static uint64_t afxdp_alloc_umem_frame(struct afxdp_socket_info *xsk)
-```
-**Purpose**: Allocate one UMEM frame from free-list
-
-**Returns**:
-- Frame address (offset into UMEM) on success
-- `AFXDP_INVALID_UMEM_FRAME` if pool exhausted
-
-**Algorithm**: Stack-based LIFO allocator (O(1))
-
----
-
-##### `afxdp_free_umem_frame()`
-```c
-static void afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame)
-```
-**Purpose**: Return a UMEM frame to free-list
-
-**Parameters**:
-- `xsk`: Socket info containing frame allocator
-- `frame`: Frame address to free
-
-**Algorithm**: Push to stack (O(1))
-
----
-
-##### `afxdp_umem_free_frames()`
-```c
-static uint64_t afxdp_umem_free_frames(struct afxdp_socket_info *xsk)
-```
-**Purpose**: Query number of free UMEM frames
-
-**Returns**: Count of available frames
-
----
-
-#### Socket Management
-
-##### `afxdp_configure_socket()`
-```c
-static struct afxdp_socket_info *afxdp_configure_socket(struct afxdp_manager_ctx *ctx)
-```
-**Purpose**: Create and configure AF_XDP socket with RX/TX rings
-
-**Returns**: Pointer to socket info, or NULL on failure
-
-**Steps**:
-1. Allocate socket info struct
-2. Configure socket parameters (ring sizes, flags)
-3. Call `xsk_socket__create()` (libxdp)
-4. Insert socket into XSKMAP (if custom XDP program)
-5. Initialize UMEM frame allocator
-6. Pre-populate Fill ring with empty frames
-
-**Ring Configuration**:
-```c
-xsk_cfg.rx_size = AFXDP_RX_RING_SIZE;
-xsk_cfg.tx_size = AFXDP_TX_RING_SIZE;
-xsk_cfg.bind_flags = XDP_ZEROCOPY | XDP_COPY;  // Try zero-copy, fallback to copy
-```
-
----
-
-#### Packet Processing
-
-##### `afxdp_process_packet()`
-```c
-static bool afxdp_process_packet(struct afxdp_socket_info *xsk,
-                                 uint64_t addr, uint32_t len)
-```
-**Purpose**: Process one received packet (bounce to TX)
-
-**Parameters**:
-- `xsk`: Socket info
-- `addr`: UMEM frame address
-- `len`: Packet length in bytes
-
-**Returns**:
-- `true`: Packet placed on TX ring (will be transmitted)
-- `false`: TX ring full, packet dropped
-
-**Logic**:
-1. Reserve slot on TX ring
-2. Copy descriptor (addr, len) to TX ring
-3. Submit descriptor to kernel
-4. Update TX statistics
-
-**Zero-Copy**: The packet data is NOT copied; only the descriptor (16 bytes) is written to the TX ring.
-
----
-
-##### `afxdp_handle_receive()`
-```c
-static void afxdp_handle_receive(struct afxdp_manager_ctx *ctx)
-```
-**Purpose**: Core RX processing - one batch of packets
-
-**Steps**:
-1. **Peek RX ring**: Check how many packets arrived
-2. **Refill Fill ring**: Provide empty UMEM frames to kernel
-3. **Process packets**: Call `afxdp_process_packet()` for each
-4. **Release RX ring**: Mark descriptors as consumed
-5. **Complete TX**: Drain Completion ring and reclaim frames
-
-**Batch Size**: Up to `AFXDP_RX_BATCH_SIZE` (64) packets per call
-
----
-
-##### `afxdp_complete_tx()`
-```c
-static void afxdp_complete_tx(struct afxdp_socket_info *xsk)
-```
-**Purpose**: Drain Completion ring and reclaim transmitted frames
-
-**Steps**:
-1. Call `sendto()` with `MSG_DONTWAIT` to kick TX processing
-2. Peek Completion ring for done frames
-3. Free each frame back to allocator
-4. Decrement `outstanding_tx` counter
-
-**Why Needed**: The kernel asynchronously transmits packets. We must poll the Completion ring to know when frames are safe to reuse.
-
----
-
-#### Statistics
-
-##### `afxdp_stats_poll()`
-```c
-static void *afxdp_stats_poll(void *arg)
-```
-**Purpose**: Statistics thread - prints RX/TX stats periodically
-
-**Runs**: In separate pthread (if `-v` flag set)
-
-**Output Format**:
-```
-AF_XDP RX:    12,345,678 pkts (1,234,567 pps) 9,876,543 Kbytes (789 Mbits/s) period:2.0
-       TX:    12,345,678 pkts (1,234,567 pps) 9,876,543 Kbytes (789 Mbits/s) period:2.0
-```
-
-**Calculations**:
-- **pps**: (current_packets - prev_packets) / time_interval
-- **Mbps**: ((current_bytes - prev_bytes) × 8) / time_interval / 1e6
-
----
-
-##### `afxdp_stats_print()`
-```c
-static void afxdp_stats_print(struct afxdp_stats_record *stats,
-                              struct afxdp_stats_record *prev)
-```
-**Purpose**: Calculate and print statistics for one interval
-
-**Parameters**:
-- `stats`: Current statistics snapshot
-- `prev`: Previous snapshot (for delta calculation)
-
----
-
-##### `afxdp_gettime()`
-```c
-static uint64_t afxdp_gettime(void)
-```
-**Purpose**: Get current monotonic time in nanoseconds
-
-**Returns**: Timestamp (uint64_t)
-
-**Uses**: `clock_gettime(CLOCK_MONOTONIC, ...)`
+A custom lockfree Single-Producer Single-Consumer (SPSC) ring is implemented as a fallback ring backend (`AFXDP_RING_BACKEND_CUSTOM`). It is **not used** in the default production configuration, which uses DPDK `rte_ring`. It can be activated by setting `AFXDP_DEFAULT_RING_BACKEND = AFXDP_RING_BACKEND_CUSTOM` in `onvm_afxdp_config.h`.
 
 ---
 
@@ -657,64 +404,78 @@ static uint64_t afxdp_gettime(void)
 
 | Flag | Argument | Description | Default |
 |------|----------|-------------|---------|
-| `-d` | `<ifname>` | Network interface name | `eth0` |
+| `-d` | `<ifname>` | Network interface name **(required)** | `eth0` |
 | `-Q` | `<queue_id>` | RX queue to bind (0-63) | `0` |
-| `-S` | - | Use SKB (generic) XDP mode | Native mode |
-| `-N` | - | Use native (driver) XDP mode | Auto-detect |
-| `-c` | - | Force copy mode (disable zero-copy) | Try zero-copy |
-| `-z` | - | Force zero-copy mode (fail if unsupported) | Try zero-copy |
-| `-p` | - | Use poll() instead of busy-wait | Busy-wait |
+| `-S` | - | Use SKB (generic) XDP mode | Native |
+| `-N` | - | Use native (driver) XDP mode | Auto |
+| `-c` | - | Force copy mode | Try zero-copy |
+| `-z` | - | Force zero-copy mode | Try zero-copy |
+| `-p` | - | Use `poll()` instead of busy-wait | Busy-wait |
+| `-C` | `<spec>` | NF chain spec (comma-separated NF names) | Required for chain mode |
+| `-N` | - | Use real NF threads (vs. dummy) | Dummy NF threads |
 | `-f` | `<file.o>` | Custom XDP kernel object file | `afxdp/af_xdp_kern.o` |
 | `-P` | `<section>` | XDP program section name | `xdp_sock_prog` |
 | `-v` | - | Enable verbose statistics output | Disabled |
-| `-t` | `<seconds>` | Auto-shutdown after N seconds | Disabled (0) |
-| `-l` | `<packets>` | Auto-shutdown after N packets | Disabled (0) |
+| `-t` | `<seconds>` | Auto-shutdown after N seconds | Disabled |
+| `-l` | `<packets>` | Auto-shutdown after N packets | Disabled |
 | `-h` | - | Show help and exit | - |
+
+### Key Compile-Time Constants (`onvm_afxdp_config.h`)
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `AFXDP_NUM_FRAMES` | `65536` | UMEM frames (must be power of 2) |
+| `AFXDP_FRAME_SIZE` | `4096` | Bytes per UMEM frame (one page) |
+| `AFXDP_RX_RING_SIZE` | `8192` | XSK RX ring descriptors |
+| `AFXDP_TX_RING_SIZE` | `8192` | XSK TX ring descriptors |
+| `AFXDP_FILL_RING_SIZE` | `8192` | Fill ring descriptors |
+| `AFXDP_COMP_RING_SIZE` | `8192` | Completion ring descriptors |
+| `AFXDP_RX_BATCH_SIZE` | `256` | Max packets per RX batch |
+| `AFXDP_TX_BATCH_SIZE` | `256` | Max packets per TX batch |
+| `AFXDP_NF_RING_SIZE` | `8192` | Per-NF rte_ring capacity |
+| `AFXDP_NF_RING_BURST` | `256` | Max dequeue burst per NF |
+| `AFXDP_PKT_HOLDER_POOL_SIZE` | `65536` | Total packet holder wrappers |
+| `AFXDP_MAX_CHAIN_LENGTH` | `8` | Max NFs in a single chain |
+| `AFXDP_STATS_INTERVAL` | `2` | Seconds between stats prints |
+| `AFXDP_DEFAULT_RING_BACKEND` | `AFXDP_RING_BACKEND_RTE` | Active ring backend |
 
 ### XDP Attachment Modes
 
-1. **Native Mode** (`-N`)
-   - XDP program runs in NIC driver
-   - Best performance (zero-copy possible)
-   - Requires driver support (i40e, ixgbe, mlx5, etc.)
-
-2. **SKB Mode** (`-S`)
-   - XDP program runs in generic kernel layer
-   - Works on any NIC
-   - Copy mode only (no zero-copy)
-   - Higher overhead
-
-3. **Auto Mode** (default)
-   - Try native mode first
-   - Fall back to SKB if native unavailable
-
-### Copy vs Zero-Copy
-
-**Zero-Copy Mode** (default, `-z` to force):
-- DMA directly to/from UMEM
-- Requires NIC driver support
-- Highest performance
-- Falls back to copy if unavailable
-
-**Copy Mode** (`-c` flag):
-- Kernel copies packets to/from UMEM
-- Works on all NICs
-- Higher CPU overhead
-- Still faster than traditional socket I/O
+1. **Native Mode** (`-N`): XDP runs in NIC driver. Best performance. Requires driver support.
+2. **SKB Mode** (`-S`): XDP runs in generic kernel layer. Works on all NICs (including `virtio_net`). Copy mode only.
+3. **Auto Mode** (default): Tries native first, falls back to SKB.
 
 ---
 
 ## Building and Compilation
 
-### Prerequisites
+### Step 1: Allocate Hugepages
+
+AF_XDP UMEM requires hugepage memory. Configure and mount hugepages before running:
+
 ```bash
-# Install dependencies (Ubuntu/Debian)
+# Check current hugepage status
+grep HugePages /proc/meminfo
+
+# Allocate 150 × 2MB hugepages (= 300 MB, enough for testing)
+echo 150 | sudo tee /proc/sys/vm/nr_hugepages
+
+# Verify allocation
+grep HugePages_Free /proc/meminfo
+# Expected: HugePages_Free: 150
+
+# If using 1GB hugepages instead, mount the hugetlbfs
+# sudo mount -t hugetlbfs -o pagesize=1G none /mnt/huge
+```
+
+### Step 2: Install Dependencies
+
+```bash
+# Install libbpf, libxdp, clang, and kernel headers (Ubuntu/Debian)
 sudo apt-get update
 sudo apt-get install -y \
-    clang \
-    llvm \
-    libbpf-dev \
-    libxdp-dev \
+    clang llvm \
+    libbpf-dev libxdp-dev \
     linux-headers-$(uname -r) \
     build-essential
 
@@ -722,768 +483,338 @@ sudo apt-get install -y \
 clang --version
 ```
 
-### Build Steps
+### Step 3: Build the eBPF Kernel Object
 
-#### 1. Build XDP Kernel Program
 ```bash
-cd onvm/onvm_mgr/afxdp
+cd ~/Afxdp_path_manager/onvm/onvm_mgr/afxdp
 make
-```
+# Output: af_xdp_kern.o (BPF bytecode)
 
-**Output**: `af_xdp_kern.o` (BPF bytecode)
-
-**Manual Build**:
-```bash
-clang -O2 -g -target bpf -c af_xdp_kern.c -o af_xdp_kern.o
-```
-
-**Verify BPF Object**:
-```bash
-llvm-objdump -S af_xdp_kern.o
+# Verify:
 file af_xdp_kern.o
-# Should show: "ELF 64-bit LSB relocatable, eBPF, version 1 (SYSV)"
+# Should show: ELF 64-bit LSB relocatable, eBPF, version 1 (SYSV)
 ```
 
-#### 2. Build OpenNetVM Manager with AF_XDP Support
+### Step 4: Build the AF_XDP Manager Binary
+
 ```bash
-cd onvm/onvm_mgr
-make MODE=AFXDP
+cd ~/Afxdp_path_manager/onvm/onvm_mgr
+
+# Full clean build (recommended after any code change)
+make MODE=AFXDP clean && make MODE=AFXDP
 ```
 
-**What Happens**:
-- Runs `make -C afxdp` to compile `af_xdp_kern.o` (eBPF bytecode)
-- Compiles `main.c` with `-DUSE_AFXDP`
-- Compiles `afxdp/onvm_afxdp.c`
-- Links against `-lxdp -lbpf -lelf -lz -lpthread`
+**What this produces:**
+- Compiles `af_xdp_kern.o` (eBPF via clang)
+- Compiles `onvm_afxdp.c`, `onvm_afxdp_chain.c`, `onvm_afxdp_ring.c`, `onvm_afxdp_nf_registry.c`, and NF sources
+- Links against `-lxdp -lbpf -lelf -lz -lpthread` and DPDK libraries
 - Produces `onvm_mgr_afxdp` binary
 
-**Build Flags** (from `onvm_mgr/Makefile`):
-```makefile
-CFLAGS += -O2 -Wall -Wextra -DUSE_AFXDP -I$(CURDIR)/afxdp
-LDLIBS += -lxdp -lbpf -lelf -lz -lpthread
-```
+### Step 5: Verify Build
 
-#### 3. Verify Build
 ```bash
-cd onvm/onvm_mgr
-
-# Check the binary exists
+# Check the binary exists and is x86-64 ELF
 file onvm_mgr_afxdp
-# Should show: ELF 64-bit LSB executable, x86-64
+# Expected: ELF 64-bit LSB executable, x86-64, dynamically linked
 
 # Check linked libraries
-ldd onvm_mgr_afxdp | grep -E 'libbpf|libxdp'
-# Should show:
-#   libbpf.so.0 => /usr/lib/x86_64-linux-gnu/libbpf.so.0
-#   libxdp.so.1 => /usr/lib/x86_64-linux-gnu/libxdp.so.1
-
-# Check eBPF object
-file afxdp/af_xdp_kern.o
-# Should show: ELF 64-bit LSB relocatable, eBPF
-```
-
-### Troubleshooting Build Issues
-
-**Problem**: `fatal error: bpf/bpf_helpers.h: No such file or directory`
-**Solution**: Install libbpf headers
-```bash
-sudo apt-get install libbpf-dev
-```
-
-**Problem**: `fatal error: xdp/xsk.h: No such file or directory`
-**Solution**: Install libxdp headers
-```bash
-sudo apt-get install libxdp-dev
-```
-
-**Problem**: `clang: error: unknown target triple 'bpf'`
-**Solution**: Update clang to version >= 10
-```bash
-sudo apt-get install clang-12
-clang-12 -target bpf -c af_xdp_kern.c -o af_xdp_kern.o
+ldd onvm_mgr_afxdp | grep -E 'libbpf|libxdp|librte'
 ```
 
 ---
 
 ## Usage Examples
 
-### Example 1: Basic Usage (Default Settings)
-```bash
-sudo ./onvm_mgr_afxdp -d eth0
-```
-- Binds to `eth0` interface, queue 0
-- Native XDP mode (auto)
-- Zero-copy if supported
-- Busy-wait polling
-
-**Expected Output**:
-```
-[AFXDP INFO] ========================================
-[AFXDP INFO]   openNetVM AF_XDP Manager Initializing
-[AFXDP INFO] ========================================
-[AFXDP INFO] Configuration:
-[AFXDP INFO]   Interface:   eth0 (index 2)
-[AFXDP INFO]   RX Queue:    0
-[AFXDP INFO]   XDP Object:  afxdp/af_xdp_kern.o
-[AFXDP INFO]   XDP Prog:    xdp_sock_prog
-[AFXDP INFO]   Poll Mode:   no
-[AFXDP INFO]   Verbose:     no
-[AFXDP INFO] Loading XDP program: afxdp/af_xdp_kern.o (section: xdp_sock_prog)
-[AFXDP INFO] XDP program attached to eth0
-[AFXDP INFO] Found xsks_map (fd=4)
-[AFXDP INFO] UMEM buffer allocated: 16384 KB
-[AFXDP INFO] AF_XDP socket created on eth0 queue 0
-[AFXDP INFO]   RX ring: 2048  TX ring: 2048  Fill ring: 2048  Comp ring: 2048
-[AFXDP INFO]   UMEM frames: 4096 × 4096 bytes = 16384 KB total
-[AFXDP INFO] ========================================
-[AFXDP INFO]   AF_XDP Manager Initialization Complete
-[AFXDP INFO] ========================================
-[AFXDP INFO] Manager entering main loop...
-[AFXDP INFO] Entering main polling loop (mode: busy-wait)
-^C
-[AFXDP INFO] Main loop exited
-[AFXDP INFO] Cleaning up AF_XDP resources...
-
---- Final Statistics ---
-RX: 1234567 packets, 987654321 bytes
-TX: 1234567 packets, 987654321 bytes
-[AFXDP INFO] XDP program detached from eth0
-[AFXDP INFO] Cleanup complete
-```
+> **Important:** The manager uses DPDK EAL (Environment Abstraction Layer) for hugepage and lcore management. DPDK EAL arguments come **before** `--`, and manager arguments come **after** `--`.
+>
+> The canonical form is:
+> ```bash
+> sudo ./onvm_mgr_afxdp [EAL args] -- [manager args]
+> ```
 
 ---
 
-### Example 2: Verbose Mode with Statistics
+### Example 1: 2-NF Chain — Busy-Wait Mode (Maximum Throughput)
+
+This is the primary production mode. Both NF threads run `simple_forward`, which sets `ACTION_NEXT` on every packet, forwarding it through the full chain before egress.
+
 ```bash
-sudo ./onvm_mgr_afxdp -d enp1s0 -Q 1 -v
-```
-- Binds to `enp1s0`, queue 1
-- Verbose statistics every 2 seconds
-
-**Expected Output** (every 2 seconds):
-```
-AF_XDP RX:      1,234,567 pkts (   617,283 pps)     987,654 Kbytes (  3950 Mbits/s) period:2.000000
-       TX:      1,234,567 pkts (   617,283 pps)     987,654 Kbytes (  3950 Mbits/s) period:2.000000
+sudo ./onvm_mgr_afxdp -- -d enp1s0 -N -Q 1 -C simple_forward,simple_forward -v
 ```
 
----
-
-### Example 3: Poll Mode (CPU-Friendly)
-```bash
-sudo ./onvm_mgr_afxdp -d eth0 -p -v
-```
-- Poll mode: uses `poll()` syscall instead of busy-wait
-- Saves CPU when idle
-- Slightly higher latency (~microseconds)
-
-**Use Case**: When CPU efficiency is more important than absolute minimum latency
-
----
-
-### Example 4: Force Copy Mode
-```bash
-sudo ./onvm_mgr_afxdp -d eth0 -c -v
-```
-- Forces copy mode (disables zero-copy)
-- Useful for debugging or unsupported NICs
-
----
-
-### Example 5: Generic (SKB) XDP Mode
-```bash
-sudo ./onvm_mgr_afxdp -d eth0 -S -v
-```
-- Uses generic XDP (works on any NIC)
-- No driver support needed
-- Copy mode only
-- Good for testing without XDP-capable hardware
-
----
-
-### Example 6: Auto-Shutdown After Time or Packets
-```bash
-# Run for 60 seconds then exit
-sudo ./onvm_mgr_afxdp -d eth0 -t 60 -v
-
-# Run until 1 million packets received
-sudo ./onvm_mgr_afxdp -d eth0 -l 1000000 -v
-```
-
-**Use Case**: Automated testing and benchmarking
-
----
-
-### Example 7: Multi-Queue Setup
-```bash
-# Terminal 1: Bind to queue 0
-sudo ./onvm_mgr_afxdp -d eth0 -Q 0 -v &
-
-# Terminal 2: Bind to queue 1
-sudo ./onvm_mgr_afxdp -d eth0 -Q 1 -v &
-
-# Terminal 3: Bind to queue 2
-sudo ./onvm_mgr_afxdp -d eth0 -Q 2 -v &
-```
-
-**Note**: Each queue needs a separate manager instance. The XDP program will redirect each queue's packets to its respective AF_XDP socket.
-
----
-
-### Example 8: Custom XDP Program
-```bash
-sudo ./onvm_mgr_afxdp -d eth0 -f my_custom_xdp.o -P my_prog_section
-```
-- Loads custom XDP program from `my_custom_xdp.o`
-- Uses section name `my_prog_section`
-- Requires custom program to have `xsks_map` BPF map
-
----
-
-### Example 9: NF Chain Mode (Default — 2-NF Chain)
-```bash
-sudo ./onvm_mgr_afxdp -d eth0 -S -v
-```
-- Starts with a 2-NF chain (`simple_forward` × 2) by default
-- Each NF sets `ACTION_NEXT` → packet walks: NF0 → NF1 → egress TX
-- Verbose mode shows per-NF statistics every 2 seconds
+- `-d enp1s0`: Bind to interface `enp1s0`
+- `-N`: Native XDP mode (use virtio driver's XDP support)
+- `-Q 1`: Bind to RX queue index 1
+- `-C simple_forward,simple_forward`: 2-NF chain with `simple_forward` at each stage
+- `-v`: Print verbose per-NF statistics every 2 seconds
 
 **Expected Initialization Output:**
 ```
-[AFXDP INFO] SPSC ring 'nf0_rx' created: 2048 slots (2047 usable)
-[AFXDP INFO] SPSC ring 'nf0_tx' created: 2048 slots (2047 usable)
-[AFXDP INFO] Chain: NF 0 initialized (simple_forward)
-[AFXDP INFO] SPSC ring 'nf1_rx' created: 2048 slots (2047 usable)
-[AFXDP INFO] SPSC ring 'nf1_tx' created: 2048 slots (2047 usable)
-[AFXDP INFO] Chain: NF 1 initialized (simple_forward)
+[AFXDP INFO] Configuration:
+[AFXDP INFO]   Interface:   enp1s0 (index 2)
+[AFXDP INFO]   RX Queue:    1
+[AFXDP INFO]   XDP Object:  afxdp/af_xdp_kern.o
+[AFXDP INFO]   XDP Prog:    xdp_sock_prog
+[AFXDP INFO]   Poll Mode:   no
+[AFXDP INFO]   Verbose:     yes
+[AFXDP INFO]   NF Chain:    simple_forward,simple_forward
+[AFXDP INFO] XDP program attached to enp1s0
+[AFXDP INFO] UMEM frames: 65536 × 4096 bytes = 262144 KB total
+[AFXDP INFO] Chain: holder pool embedded in UMEM buffer (65536 holders, 24 bytes each)
+[AFXDP INFO] Chain: NF 0 initialized
+[AFXDP INFO] Chain: NF 1 initialized
 [AFXDP INFO] ========================================
 [AFXDP INFO]   NF Chain Initialized: 2 NFs
-[AFXDP INFO]   Ring backend: CUSTOM SPSC
-[AFXDP INFO]   Ring size: 1024  Burst: 64
+[AFXDP INFO]   Ring backend: DPDK rte_ring
+[AFXDP INFO]   Ring size: 8192  Burst: 256
 [AFXDP INFO] ========================================
+[AFXDP INFO] Launching worker threads: RX=1  TX=1  Mgr=1  Wakeup=1
+[AFXDP INFO] Launching 2 real NF threads
+[AFXDP INFO] Thread pinned to core 1   (RX thread)
+[AFXDP INFO] Thread pinned to core 2   (TX thread)
+[AFXDP INFO] Thread pinned to core 3   (NF 0)
+[AFXDP INFO] Thread pinned to core 4   (NF 1)
+[AFXDP INFO] Entering main polling loop (mode: busy-wait)
 ```
 
 **Expected Per-Interval Stats (with traffic):**
 ```
-AF_XDP RX:      5,000 pkts (  2,500 pps)       320 Kbytes (  1280 Kbits/s) period:2.000000
-       TX:      5,000 pkts (  2,500 pps)       320 Kbytes (  1280 Kbits/s) period:2.000000
+AF_XDP RX:   7,999,581 pkts (1,502,986 pps)   4,095,785 Kbytes (6156 Mbits/s) period:2.000124
+       TX:   2,714,326 pkts (   512,669 pps)   1,389,734 Kbytes (2100 Mbits/s) period:2.000124
 
 --- NF Chain Statistics ---
-  NF 0: RX 5000 pkts (320000 B)  TX 5000 pkts (320000 B)  Dropped 0
-  NF 1: RX 5000 pkts (320000 B)  TX 5000 pkts (320000 B)  Dropped 0
+  NF 0: RX 7999645 pkts (4095818240 B)  TX 7999645 pkts (4095818240 B)  Dropped 0
+  NF 1: RX 7999645 pkts (4095818240 B)  TX 2714432 pkts (1389789184 B)  Dropped 0
 ---
 ```
 
-**Expected Final Stats (Ctrl+C):**
-```
-[AFXDP INFO] Tearing down NF chain...
-
---- NF Chain Statistics ---
-  NF 0: RX 50000 pkts (3200000 B)  TX 50000 pkts (3200000 B)  Dropped 0
-  NF 1: RX 50000 pkts (3200000 B)  TX 50000 pkts (3200000 B)  Dropped 0
 ---
 
---- Final Statistics ---
-RX: 50000 packets, 3200000 bytes
-TX: 50000 packets, 3200000 bytes
-[AFXDP INFO] NF chain teardown complete
+### Example 2: SKB (Generic) XDP Mode
+
+Use this when the NIC does not support native XDP (e.g., older NICs, or when `-N` causes driver errors):
+
+```bash
+sudo ./onvm_mgr_afxdp -- -d enp1s0 -S -Q 1 -C simple_forward,simple_forward -v
+```
+
+---
+
+### Example 3: Poll Mode (CPU-Friendly, Lower Throughput)
+
+Poll mode uses `poll()` to sleep until packets arrive, saving CPU cycles when idle. This is suitable for low-traffic environments but **significantly reduces throughput** (~10x) under heavy load compared to busy-wait:
+
+```bash
+sudo ./onvm_mgr_afxdp -- -d enp1s0 -N -p -Q 1 -C simple_forward,simple_forward -v
+```
+
+> **Note:** For maximum throughput testing, always omit `-p` and use busy-wait mode.
+
+---
+
+### Example 4: Auto-Shutdown After a Fixed Duration
+
+Useful for automated benchmarking:
+
+```bash
+# Run for exactly 30 seconds then cleanly exit
+sudo ./onvm_mgr_afxdp -- -d enp1s0 -N -Q 1 -C simple_forward,simple_forward -v -t 30
+```
+
+---
+
+### Example 5: Check EAL Options (DPDK Lcore Pinning)
+
+To pin DPDK's main thread to a specific core (e.g., core 0) and limit DPDK to specific cores, pass EAL arguments before `--`:
+
+```bash
+# Use cores 0-4 for DPDK, bind AF_XDP threads to cores 1-4
+sudo ./onvm_mgr_afxdp -l 0-4 -- -d enp1s0 -N -Q 1 -C simple_forward,simple_forward -v
+```
+
+To see all available DPDK EAL options:
+```bash
+sudo ./onvm_mgr_afxdp --help
 ```
 
 ---
 
 ## Testing Methods
 
-### 0. NF Chain Verification (Phase-1)
+### Test Environment Setup (2-VM Configuration)
 
-These tests validate that the NF chaining infrastructure works correctly: packets enter the chain, pass through all NFs, and exit to the NIC with matching counters.
+All testing was performed on a **2-VM setup** running on the same QEMU/KVM host:
 
-#### Prerequisites
-```bash
-# Build the project
-cd onvm/onvm_mgr
-make clean && make MODE=AFXDP
+| VM | Role | Interface | IP |
+|----|------|-----------|-----|
+| **vm1** | Traffic Generator (pktgen) | `enp1s0` | 192.168.100.1 |
+| **vm2** | AF_XDP Manager (DUT) | `enp1s0` | 192.168.100.2 |
 
-# Verify binary includes chain support
-./onvm_mgr_afxdp -h
-```
+Both VMs use `virtio_net` (driver: `virtio-pci`, device `1af4:1041`).
 
-#### Test A: Chain Initialization (No Traffic)
-
-**Purpose:** Verify that the 2-NF chain initializes correctly without any traffic.
-
-```bash
-# Start manager and immediately Ctrl+C
-sudo timeout 3 ./onvm_mgr_afxdp -d eth0 -S -v || true
-```
-
-**✅ Pass if output contains ALL of:**
-- `NF Chain Initialized: 2 NFs`
-- `Ring backend: CUSTOM SPSC`
-- `Chain: NF 0 initialized (simple_forward)`
-- `Chain: NF 1 initialized (simple_forward)`
-- `SPSC ring 'nf0_rx' created`
-- `SPSC ring 'nf1_rx' created`
-- `NF chain teardown complete` (on exit)
-
-**❌ Fail if output contains:**
-- `NF chain initialization failed`
-- `Running in legacy bounce mode`
-- Any segfault or abort
+> **Note on virtio_net XDP:** When using native XDP (`-N`) with `virtio_net`, the driver may print:
+> ```
+> virtio_net virtio1 enp1s0: XDP request 13 queues but max is 4.
+> XDP_TX and XDP_REDIRECT will operate in a slower locked tx mode.
+> ```
+> This is a **harmless warning**. The AF_XDP userspace path is unaffected by locked tx mode.
 
 ---
 
-#### Test B: Packet Counters Match Through Chain (With Traffic)
-
-**Purpose:** Verify that every received packet passes through both NFs with zero drops.
-
-**Setup:** Two machines or two interfaces on the same machine.
+### Test 1: Allocate Hugepages (vm2 — DUT)
 
 ```bash
-# Terminal 1 (receiver): Start manager in verbose mode
-sudo ./onvm_mgr_afxdp -d eth0 -S -v -l 10000
-```
+# On vm2 before running the manager
+echo 150 | sudo tee /proc/sys/vm/nr_hugepages
 
-```bash
-# Terminal 2 (sender): Generate exactly 10,000 packets
-sudo ping -f -c 10000 <receiver_ip>
-# Or:
-sudo mausezahn eth0 -c 10000 -t udp "dp=5000" -A <src_ip> -B <dst_ip>
-```
+# Verify
+grep HugePages_Free /proc/meminfo
+# Expected: HugePages_Free: 150
 
-**✅ Pass if ALL conditions are met:**
-
-| Counter | Expected Value | How to Check |
-|---------|---------------|---------------|
-| XSK RX packets | ~10,000 | `Final Statistics → RX` |
-| XSK TX packets | ~10,000 *(same as RX)* | `Final Statistics → TX` |
-| NF 0 RX packets | == XSK RX | `NF Chain Statistics → NF 0 RX` |
-| NF 0 TX packets | == NF 0 RX | `NF Chain Statistics → NF 0 TX` |
-| NF 1 RX packets | == NF 0 TX | `NF Chain Statistics → NF 1 RX` |
-| NF 1 TX packets | == NF 1 RX | `NF Chain Statistics → NF 1 TX` |
-| NF 0 Dropped | 0 | `NF Chain Statistics → NF 0 Dropped` |
-| NF 1 Dropped | 0 | `NF Chain Statistics → NF 1 Dropped` |
-
-**Key invariant:** `XSK RX == NF0 RX == NF0 TX == NF1 RX == NF1 TX == XSK TX`
-
----
-
-#### Test C: Chain Graceful Fallback
-
-**Purpose:** Verify that if chain init fails, the manager falls back to legacy bounce mode.
-
-This can be tested by temporarily modifying `afxdp_chain_init()` to return `-1`, rebuilding, and running:
-
-```bash
-sudo ./onvm_mgr_afxdp -d eth0 -S -v -t 5
-```
-
-**✅ Pass if output contains:**
-- `NF chain initialization failed`
-- `Running in legacy bounce mode`
-- Manager continues running (does not crash)
-- RX and TX counters still increment (bounce mode works)
-
----
-
-#### Test D: UMEM Integrity Under Sustained Load
-
-**Purpose:** Verify no UMEM frame leaks over extended traffic.
-
-```bash
-# Run for 60 seconds under sustained traffic
-sudo ./onvm_mgr_afxdp -d eth0 -S -v -t 60
-```
-
-```bash
-# In another terminal: sustained flood
-sudo ping -f <receiver_ip>
-# Run for the full 60 seconds
-```
-
-**✅ Pass if:**
-- Manager does not crash or hang
-- Final `NF 0 Dropped` and `NF 1 Dropped` remain 0 (or very low)
-- `XSK RX ≈ XSK TX` (within 1-2% due to timing)
-- No `holder pool exhausted` warnings in output
-
----
-
-#### Test E: Chain Stats Printing
-
-**Purpose:** Verify that verbose mode prints per-NF stats alongside XSK stats.
-
-```bash
-sudo ./onvm_mgr_afxdp -d eth0 -S -v -t 10
-```
-
-```bash
-# Generate continuous traffic
-sudo ping -f <receiver_ip>
-```
-
-**✅ Pass if:**
-- Per-NF stats (`--- NF Chain Statistics ---`) print every ~2 seconds
-- NF counters increment between intervals
-- Both NF 0 and NF 1 show non-zero RX/TX after traffic starts
-- Stats format matches: `NF <id>: RX <n> pkts (<n> B) TX <n> pkts (<n> B) Dropped <n>`
-
----
-
-#### Automated NF Chain Test Script
-```bash
-#!/bin/bash
-# test_nf_chain.sh — Validates NF chaining functionality
-
-set -e
-IFACE="${1:-eth0}"
-MGR="./onvm_mgr_afxdp"
-
-echo "=== AF_XDP NF Chain Tests ==="
-echo "Interface: $IFACE"
-echo ""
-
-# Test A: Chain initialization
-echo "Test A: Chain initialization (3s timeout)..."
-OUT=$(sudo timeout 3 $MGR -d $IFACE -S -v 2>&1 || true)
-if echo "$OUT" | grep -q "NF Chain Initialized: 2 NFs"; then
-    echo "  ✅ Chain initialized with 2 NFs"
-else
-    echo "  ❌ Chain initialization failed"
-    echo "$OUT"
-    exit 1
-fi
-
-if echo "$OUT" | grep -q "NF chain teardown complete"; then
-    echo "  ✅ Chain teardown clean"
-else
-    echo "  ⚠️  Chain teardown message not found (may be normal with timeout)"
-fi
-
-# Test B: Rings created
-for i in 0 1; do
-    if echo "$OUT" | grep -q "SPSC ring 'nf${i}_rx' created"; then
-        echo "  ✅ NF ${i} RX ring created"
-    else
-        echo "  ❌ NF ${i} RX ring missing"
-        exit 1
-    fi
-done
-
-# Test C: Ring backend
-if echo "$OUT" | grep -q "Ring backend: CUSTOM SPSC"; then
-    echo "  ✅ Custom SPSC backend active"
-else
-    echo "  ❌ Unexpected ring backend"
-    exit 1
-fi
-
-echo ""
-echo "=== All NF Chain Tests Passed ==="
-echo "Note: Run Test B (counter matching) manually with traffic."
-```
-
-**Usage:**
-```bash
-chmod +x test_nf_chain.sh
-sudo ./test_nf_chain.sh eth0
+# If using DPDK EAL: ensure hugepages are also visible to DPDK
+sudo dpdk-hugepages.py --setup 300M
 ```
 
 ---
 
-### 1. Functional Testing
+### Test 2: Configure pktgen Traffic Generator (vm1)
 
-#### Test 1: Verify XDP Program Loading
 ```bash
-# Start manager
-sudo ./onvm_mgr_afxdp -d eth0 -v
-
-# In another terminal, check XDP status
-sudo ip link show eth0
-# Should show: "xdp/id:123"
-
-# Inspect BPF programs
-sudo bpftool prog show
-# Should list the loaded XDP program
-
-# Inspect BPF maps
-sudo bpftool map show
-# Should show xsks_map and xdp_stats_map
-```
-
----
-
-#### Test 2: Traffic Forwarding
-```bash
-# Setup:
-# - Host A (10.0.0.1): Running onvm_mgr
-# - Host B (10.0.0.2): Traffic generator
-
-# On Host A
-sudo ./onvm_mgr_afxdp -d eth0 -v
-
-# On Host B (generate traffic)
-ping -c 100 10.0.0.1
-
-# Or use traffic generator
-sudo mausezahn eth0 -c 1000 -d 10msec -t udp "dp=80,sp=1234" -A 10.0.0.2 -B 10.0.0.1
-```
-
-**Expected Result**: Manager should show RX and TX packet counts increasing
-
----
-
-#### Test 3: Multi-Queue Distribution
-```bash
-# Configure NIC for multi-queue
-sudo ethtool -L eth0 combined 4
-
-# Start managers on each queue
-for q in 0 1 2 3; do
-    sudo ./onvm_mgr_afxdp -d eth0 -Q $q -v -l 10000 &
-done
-
-# Generate traffic to hit multiple queues
-# (Use RSS or manual steering)
-```
-
----
-
-### 2. Performance Testing
-
-#### Test 1: Throughput Benchmark
-```bash
-# Using pktgen (kernel packet generator)
+# On vm1 — load kernel pktgen module
 sudo modprobe pktgen
 
-# Configure pktgen to send to eth0
-cat <<EOF | sudo tee /proc/net/pktgen/kpktgend_0
-rem_device_all
-add_device eth0
-EOF
+PGDEV=/proc/net/pktgen
+IFACE=enp1s0
+DST_MAC=<mac address of vm2 enp1s0>
+DST_IP=192.168.100.2
+PKT_SIZE=512   # bytes (adjust for different test conditions)
 
-cat <<EOF | sudo tee /proc/net/pktgen/eth0
-clone_skb 0
-pkt_size 64
-count 10000000
-dst 10.0.0.1
-dst_mac aa:bb:cc:dd:ee:ff
-EOF
+# Configure pktgen thread
+echo "rem_device_all" | sudo tee $PGDEV/kpktgend_0
+echo "add_device $IFACE" | sudo tee $PGDEV/kpktgend_0
 
-# Start manager
-sudo ./onvm_mgr_afxdp -d eth0 -v
+# Configure device parameters
+echo "pkt_size $PKT_SIZE"   | sudo tee $PGDEV/$IFACE
+echo "dst_mac $DST_MAC"     | sudo tee $PGDEV/$IFACE
+echo "dst $DST_IP"          | sudo tee $PGDEV/$IFACE
+echo "count 0"              | sudo tee $PGDEV/$IFACE   # 0 = infinite
+echo "clone_skb 0"          | sudo tee $PGDEV/$IFACE
 
-# In another terminal, start pktgen
-echo "start" | sudo tee /proc/net/pktgen/pgctrl
-
-# Check results
-cat /proc/net/pktgen/eth0
+# Start traffic (runs until Ctrl-C)
+echo "start" | sudo tee $PGDEV/pgctrl
 ```
 
 ---
 
-#### Test 2: Latency Measurement
+### Test 3: Run the 2-NF Chain Stress Test (vm2)
+
 ```bash
-# Install sockperf
-sudo apt-get install sockperf
+# On vm2 — must run as root
+cd ~/Afxdp_path_manager/onvm/onvm_mgr
 
-# On receiver (with AF_XDP manager)
-sudo ./onvm_mgr_afxdp -d eth0 -v
-
-# On sender
-sockperf ping-pong -i 10.0.0.1 -p 11111 --pps 1000 --time 60
+sudo ./onvm_mgr_afxdp -- -d enp1s0 -N -Q 1 -C simple_forward,simple_forward -v
 ```
 
-**Metrics to Record**:
-- Average latency
-- 99th percentile latency
-- Maximum latency
+Observe the per-NF statistics printed every 2 seconds. Press `Ctrl-C` to stop.
+
+**Expected behavior:**
+- `[AFXDP INFO] Thread pinned to core N` messages confirm CPU affinity is active
+- Both `NF 0 Dropped` and `NF 1 Dropped` should be **0** (zero internal ring drops)
+- `AF_XDP TX` drops are the expected egress drops caused by virtio TX backpressure — these are graceful and do not indicate a bug
 
 ---
 
-#### Test 3: CPU Utilization
+### Test 4: Verify Thread CPU Affinity
+
+On vm2, while the manager is running, check thread pinning:
+
 ```bash
-# Start manager
-sudo ./onvm_mgr_afxdp -d eth0 -v &
-PID=$!
+# In a second terminal on vm2
+ps -eLf | grep onvm_mgr_afxdp | awk '{print $4}' | while read tid; do
+    echo -n "TID $tid → core: "
+    cat /proc/$tid/status | grep Cpus_allowed_list
+done
 
-# Monitor CPU usage
-sudo perf stat -p $PID -e cycles,instructions,cache-misses,LLC-loads,LLC-load-misses sleep 30
-
-# Or use top
-top -p $PID
+# Or use taskset
+for tid in $(ps -eLf | grep onvm_mgr | awk '{print $4}'); do
+    echo "TID $tid on core: $(taskset -cp $tid 2>/dev/null | awk '{print $NF}')"
+done
 ```
+
+**Expected:** RX, TX, and NF threads each show a single dedicated core.
 
 ---
 
-### 3. Stress Testing
+### Benchmark Results (2-VM / virtio_net / 512B packets / 2-NF chain)
 
-#### Test 1: Packet Drop Under Load
-```bash
-# Start manager
-sudo ./onvm_mgr_afxdp -d eth0 -v
+These results were obtained with the full thread affinity implementation and the optimized UMEM pool size (65536 frames):
 
-# Generate high packet rate
-sudo pkt-gen -i eth0 -f tx -r 10000000  # 10 Mpps
+| Metric | Measured Value | Notes |
+|--------|---------------|-------|
+| **Peak Ingress (Wire→Userspace)** | **~1.51 Million pps** | AF_XDP RX ring burst |
+| **Peak Ingress Bandwidth** | **~6.2 Gbps** | @ 512B packets |
+| **Internal NF Throughput** | **~1.51 Million pps** | 0 internal drops (NF 0 TX == NF 0 RX) |
+| **Peak Egress (Userspace→Wire)** | **~512,000 pps** | Limited by virtio TX locked mode |
+| **Peak Egress Bandwidth** | **~2.1 Gbps** | @ 512B packets |
+| **NF 0 Internal Drops** | **0** | All packets passed NF 0 without loss |
+| **NF 1 Internal Drops** | **0** | All packets passed NF 1 without loss |
 
-# Monitor drops
-ethtool -S eth0 | grep drop
+**Bottleneck Analysis:**
+The ~3x gap between ingress (1.51M pps) and egress (512k pps) is a **NIC driver limitation** of the emulated `virtio_net` adapter (locked TX mode) — not a software bottleneck. The AF_XDP userspace pipeline processed all packets correctly; the excess packets are gracefully dropped at the egress edge by the TX thread.
+
+**Sample log at peak throughput:**
 ```
+AF_XDP RX:  11,030,844 pkts (1,515,506 pps)  5,647,792 Kbytes (6208 Mbits/s) period:2.000123
+       TX:   3,722,304 pkts (  503,905 pps)  1,905,819 Kbytes (2064 Mbits/s) period:2.000123
 
+--- NF Chain Statistics ---
+  NF 0: RX 11030972 pkts (5647857664 B)  TX 11030908 pkts (5647824896 B)  Dropped 0
+  NF 1: RX 11030780 pkts (5647759360 B)  TX 3722304 pkts (1905819648 B)  Dropped 0
 ---
-
-#### Test 2: Memory Leak Detection
-```bash
-# Install valgrind
-sudo apt-get install valgrind
-
-# Run manager under valgrind
-sudo valgrind --leak-check=full --show-leak-kinds=all \
-    ./onvm_mgr_afxdp -d eth0 -t 30 -v
-
-# Check for memory leaks in output
-```
-
----
-
-### 4. Error Handling Testing
-
-#### Test 1: Invalid Interface
-```bash
-sudo ./onvm_mgr_afxdp -d invalid_if
-# Expected: Error message and exit
 ```
 
 ---
 
-#### Test 2: Permission Denied
-```bash
-# Run without sudo
-./onvm_mgr_afxdp -d eth0
-# Expected: Permission error or capability error
+### Test 5: Functional Ring Validation (Zero-Drop Invariant)
+
+Under any traffic load, the key correctness invariant is:
+
 ```
+NF 0 TX packets == NF 1 RX packets  (no drops between stages)
+NF 1 dropped == 0                   (last NF never drops to its own TX ring)
+```
+
+To verify after a test run, look at the Final Statistics block:
+
+```bash
+# Expected output on Ctrl-C:
+--- NF Chain Statistics ---
+  NF 0: RX 12973899 pkts (6642636288 B)  TX 12973899 pkts (6642636288 B)  Dropped 0
+  NF 1: RX 12973899 pkts (6642636288 B)  TX 4385226 pkts (2245235712 B)  Dropped 0
+---
+```
+
+If `NF 0 Dropped > 0`, the NF 1 RX ring was full — typically indicates NF 1 fell behind NF 0 due to CPU scheduling contention. Verify thread affinity is active (Test 4).
 
 ---
 
-#### Test 3: XDP Already Attached
-```bash
-# Start first instance
-sudo ./onvm_mgr_afxdp -d eth0 &
+### Test 6: BPF Map Inspection (Debug)
 
-# Try to start second instance on same queue
-sudo ./onvm_mgr_afxdp -d eth0 -Q 0
-# Expected: Error (XDP program already attached)
-```
-
----
-
-### 5. Compatibility Testing
-
-#### Test 1: Different NIC Drivers
-Test on various drivers:
-- **i40e** (Intel XL710)
-- **ixgbe** (Intel 82599)
-- **mlx5** (Mellanox ConnectX-5)
-- **virtio_net** (virtual NIC, SKB mode only)
+While the manager is running, inspect the XSKMAP to confirm the socket is registered:
 
 ```bash
-# Check driver
-ethtool -i eth0 | grep driver
+sudo bpftool map show
+# Find the xsks_map entry
 
-# Test native mode
-sudo ./onvm_mgr_afxdp -d eth0 -N -v
-
-# Test SKB mode
-sudo ./onvm_mgr_afxdp -d eth0 -S -v
-```
-
----
-
-#### Test 2: Kernel Version Compatibility
-```bash
-uname -r  # Check kernel version
-
-# Test on:
-# - 5.3.x (minimum supported)
-# - 5.11.x (improved AF_XDP)
-# - 5.15.x (LTS with enhancements)
-# - 6.x (latest)
-```
-
----
-
-### 6. Debugging Tests
-
-#### Test 1: BPF Program Verification
-```bash
-# Load and verify BPF program manually
-sudo bpftool prog load af_xdp_kern.o /sys/fs/bpf/xdp_test
-
-# Check verifier log
-dmesg | tail -50
-```
-
----
-
-#### Test 2: Ring Inspection
-```bash
-# While manager is running, inspect maps
 sudo bpftool map dump name xsks_map
-sudo bpftool map dump name xdp_stats_map
+# Should show: key 0x01 (queue 1) → value <fd>
 ```
 
----
+Confirm XDP is attached to the interface:
 
-### 7. Integration Testing
-
-#### Test 1: With Traffic Generator
 ```bash
-# Use MoonGen (high-performance traffic generator)
-cd tools/Pktgen
-./MoonGen examples/l2-forward.lua 0 1
-
-# Manager should receive and bounce packets
-sudo ./onvm_mgr_afxdp -d eth1 -v
-```
-
----
-
-### 8. Regression Testing Script
-```bash
-#!/bin/bash
-# test_afxdp.sh - Comprehensive test suite
-
-set -e
-
-IFACE="eth0"
-MGR="./onvm_mgr_afxdp"
-
-echo "=== AF_XDP Regression Tests ==="
-
-# Test 1: Basic startup and shutdown
-echo "Test 1: Basic startup/shutdown"
-timeout 5 sudo $MGR -d $IFACE -v || true
-echo "✓ Pass"
-
-# Test 2: Stats thread
-echo "Test 2: Stats thread"
-timeout 10 sudo $MGR -d $IFACE -v -t 5
-echo "✓ Pass"
-
-# Test 3: Poll mode
-echo "Test 3: Poll mode"
-timeout 5 sudo $MGR -d $IFACE -p || true
-echo "✓ Pass"
-
-# Test 4: SKB mode
-echo "Test 4: SKB mode"
-timeout 5 sudo $MGR -d $IFACE -S || true
-echo "✓ Pass"
-
-# Test 5: Auto-shutdown on packet count
-echo "Test 5: Packet limit"
-timeout 30 sudo $MGR -d $IFACE -l 1000 || true
-echo "✓ Pass"
-
-echo "=== All Tests Passed ==="
+sudo ip link show enp1s0 | grep xdp
+# Expected: xdp/id:<prog_id>
 ```
 
 ---
