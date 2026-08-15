@@ -1370,7 +1370,7 @@ static void *
 afxdp_rx_thread_main(void *arg) {
         struct afxdp_manager_ctx *ctx = (struct afxdp_manager_ctx *)arg;
 
-        afxdp_set_thread_affinity(1);
+        afxdp_set_thread_affinity(AFXDP_BASE_CORE + 0);
         afxdp_rx_and_process(ctx);
         return NULL;
 }
@@ -1394,7 +1394,7 @@ afxdp_tx_thread_main(void *arg) {
                 return NULL;
         }
 
-        afxdp_set_thread_affinity(2);
+        afxdp_set_thread_affinity(AFXDP_BASE_CORE + 1);
 
         AFXDP_LOG_INFO("TX thread started (NFs=%u)", chain->chain_length);
 
@@ -1535,7 +1535,7 @@ afxdp_dummy_nf_thread(void *arg) {
 
         AFXDP_LOG_INFO("Dummy NF %u thread started", nf->nf_id);
 
-        afxdp_set_thread_affinity(3 + nf_arg->nf_idx);
+        afxdp_set_thread_affinity(AFXDP_BASE_CORE + 2 + nf_arg->nf_idx);
 
         while (!ctx->global_exit) {
 #if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
@@ -1592,7 +1592,7 @@ afxdp_real_nf_thread(void *arg) {
 
         AFXDP_LOG_INFO("Real NF %u thread started", nf->nf_id);
 
-        afxdp_set_thread_affinity(3 + nf_arg->nf_idx);
+        afxdp_set_thread_affinity(AFXDP_BASE_CORE + 2 + nf_arg->nf_idx);
 
         if (!nf->function_table || !nf->function_table->pkt_handler) {
                 AFXDP_LOG_ERR("Real NF %u has no function_table — chain was not "

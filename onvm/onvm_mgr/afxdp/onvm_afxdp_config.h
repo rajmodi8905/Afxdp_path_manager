@@ -114,6 +114,10 @@
  * as a hook for future shared-core NF wakeup support. */
 #define AFXDP_NUM_WAKEUP_THREADS     1
 
+/* Base CPU core to start pinning threads to. 
+ * Important for NUMA optimization (e.g., set to 24 for NUMA node 3) */
+#define AFXDP_BASE_CORE              24
+
 /**********************XSKMAP Configuration***********************************/
 
 /* Maximum number of AF_XDP sockets in the XSKMAP (one per RX queue).
