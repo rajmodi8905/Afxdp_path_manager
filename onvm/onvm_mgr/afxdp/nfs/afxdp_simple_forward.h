@@ -1,0 +1,73 @@
+/*********************************************************************
+ *                     openNetVM
+ *              https://sdnfv.github.io
+ *
+ *   BSD LICENSE
+ *
+ *   Copyright(c)
+ *            2015-2019 George Washington University
+ *            2015-2019 University of California Riverside
+ *   All rights reserved.
+ *
+ *   Redistribution and use in source and binary forms, with or without
+ *   modification, are permitted provided that the following conditions
+ *   are met:
+ *
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in
+ *       the documentation and/or other materials provided with the
+ *       distribution.
+ *     * The name of the author may not be used to endorse or promote
+ *       products derived from this software without specific prior
+ *       written permission.
+ *
+ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ ********************************************************************/
+
+/******************************************************************************
+
+                        afxdp_simple_forward.h
+
+    Simple forward NF for AF_XDP chaining.
+
+    This is the most basic NF: it sets meta.action = AFXDP_NF_ACTION_NEXT
+    to pass every packet to the next NF in the chain. Functionally
+    equivalent to the openNetVM simple_forward example NF.
+
+******************************************************************************/
+
+#ifndef _AFXDP_SIMPLE_FORWARD_H_
+#define _AFXDP_SIMPLE_FORWARD_H_
+
+#include "../onvm_afxdp_types.h"
+
+/**
+ * Simple forward handler — passes every packet to the next NF.
+ *
+ * Sets pkt->meta.action = AFXDP_NF_ACTION_NEXT.
+ *
+ * @param pkt
+ *   Packet holder dequeued from this NF's RX ring.
+ * @param nf
+ *   Pointer to this NF's state.
+ * @return
+ *   0 always (no error).
+ */
+int
+afxdp_simple_forward_handler(struct afxdp_pkt_holder *pkt,
+                             struct afxdp_nf *nf);
+
+#endif /* _AFXDP_SIMPLE_FORWARD_H_ */

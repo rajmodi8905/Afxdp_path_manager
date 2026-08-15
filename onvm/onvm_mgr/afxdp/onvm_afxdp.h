@@ -43,20 +43,20 @@
 
     Public API for the AF_XDP-based NF Manager datapath.
 
-    The manager acts as the only NF: it receives packets from the NIC
-    via AF_XDP and immediately bounces them back out to the NIC
-    (zero-copy through the same UMEM).
+    The manager receives packets from the NIC via AF_XDP and routes them
+    through a chain of in-process NF handlers using SPSC rings and
+    packet holders (zero-copy through shared UMEM).
 
-    This header exposes three functions that replace the entire DPDK
+    This header exposes four functions that replace the entire DPDK
     manager pipeline when compiled with -DUSE_AFXDP:
 
-      1. afxdp_init()    — Parse args, set up UMEM, create XSK socket,
-                           load & attach XDP program, populate XSKMAP.
-      2. afxdp_run()     — Enter the main polling loop: receive packets,
-                           place them on the TX ring to send back to NIC,
-                           refill the Fill ring, and complete TX.
-      3. afxdp_cleanup() — Detach the XDP program, destroy XSK socket
-                           and UMEM, free all resources.
+      1. afxdp_preallocate_hugepages() — Claim UMEM hugepages before
+                                          rte_eal_init() (hugepage partitioning).
+      2. afxdp_init()    — Parse args, set up UMEM, create XSK socket,
+                           load & attach XDP program, initialize NF chain.
+      3. afxdp_run()     — Enter the main polling loop: receive packets,
+                           route through NF chain, transmit egress.
+      4. afxdp_cleanup() — Tear down NF chain, detach XDP, free resources.
 
 ******************************************************************************/
 
@@ -64,6 +64,7 @@
 #define _ONVM_AFXDP_H_
 
 #include "onvm_afxdp_types.h"
+#include "onvm_afxdp_chain.h"
 
 /******************************** Public API **********************************/
 

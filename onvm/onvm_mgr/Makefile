@@ -46,47 +46,7 @@ ENABLE_FLOW_LOOKUP=1
 # ============================================================================
 MODE ?= DPDK
 
-# ---- AF_XDP MODE -----------------------------------------------------------
-ifeq ($(MODE),AFXDP)
-
-# The AF_XDP manager is a standalone binary — no DPDK EAL needed.
-# We compile only main.c + the AF_XDP library, link against libxdp/libbpf.
-
-CC       ?= gcc
-CFLAGS   += -O2 -Wall -Wextra -DUSE_AFXDP
-CFLAGS   += -I$(CURDIR)/afxdp
-LDLIBS   += -lxdp -lbpf -lelf -lz -lpthread
-
-APP       = onvm_mgr_afxdp
-
-SRCS      = main.c afxdp/onvm_afxdp.c
-
-OBJS      = $(SRCS:.c=.o)
-
-.PHONY: all clean bpf
-
-all: bpf $(APP)
-
-# Build the eBPF kernel object first
-bpf:
-	$(MAKE) -C afxdp
-
-$(APP): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-	@echo ""
-	@echo "  Built $(APP) (AF_XDP mode)"
-	@echo "  BPF kernel object: afxdp/af_xdp_kern.o"
-	@echo ""
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-clean:
-	rm -f $(APP) $(OBJS)
-	$(MAKE) -C afxdp clean
-
-# ---- DPDK MODE (original) --------------------------------------------------
-else
+ONVM_MGR_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
 ifeq ($(RTE_SDK),)
 $(error "Please define RTE_SDK environment variable")
@@ -101,6 +61,25 @@ ifneq ($(CONFIG_RTE_EXEC_ENV),"linuxapp")
 $(error This application can only operate in a linuxapp environment, \
 please change the definition of the RTE_TARGET environment variable)
 endif
+
+# ---- AF_XDP MODE -----------------------------------------------------------
+ifeq ($(MODE),AFXDP)
+APP = onvm_mgr_afxdp
+SRCS-y := main.c afxdp/onvm_afxdp.c afxdp/onvm_afxdp_ring.c afxdp/onvm_afxdp_chain.c afxdp/onvm_afxdp_nf_registry.c afxdp/nfs/afxdp_simple_forward.c
+
+CFLAGS += -O2 -Wall -Wextra -DUSE_AFXDP -I$(ONVM_MGR_DIR)/afxdp
+LDFLAGS += -lxdp -lbpf -lelf -lz -lpthread
+
+# Build the eBPF kernel object before building the app. Use an absolute path
+# since DPDK's extapp flow may execute recipes from a different working dir.
+all: bpf
+
+.PHONY: bpf	
+bpf:
+	$(MAKE) -C $(ONVM_MGR_DIR)/afxdp
+
+# ---- DPDK MODE (original) --------------------------------------------------
+else
 
 # binary name
 APP = onvm_mgr
@@ -119,10 +98,10 @@ ifeq ($(ENABLE_FLOW_LOOKUP), 1)
 CFLAGS +=-D FLOW_LOOKUP
 endif
 
+endif # MODE == AFXDP
+
 # for newer gcc, e.g. 4.4, no-strict-aliasing may not be necessary
-# and so the next line can be removed in those cases.
 EXTRA_CFLAGS += -fno-strict-aliasing
 
 include $(RTE_SDK)/mk/rte.extapp.mk
 
-endif # MODE == DPDK

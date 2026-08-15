@@ -56,7 +56,9 @@
  */
 
 #ifdef USE_AFXDP
+/* AF_XDP mode: AF_XDP manager header */
 #include "afxdp/onvm_afxdp.h"
+#include <rte_eal.h>
 
 #else
 /* DPDK mode: full openNetVM manager headers */
@@ -374,13 +376,24 @@ main(int argc, char *argv[]) {
          *  The XDP kernel program steers packets from the NIC into
          *  userspace via XSKMAP + bpf_redirect_map(). The userspace
          *  manager polls the AF_XDP RX ring and processes packets.
-         *
-         *  No DPDK EAL, no rte_mbuf, no hugepages required.
          ******************************************************************/
         struct afxdp_manager_ctx ctx;
         int ret;
 
         memset(&ctx, 0, sizeof(ctx));
+
+#if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
+        /* Initialize DPDK EAL so that rte_ring_create() is available.
+         * This does NOT start the full openNetVM DPDK manager. */
+        ret = rte_eal_init(argc, argv);
+        if (ret < 0) {
+                fprintf(stderr, "rte_eal_init failed (err=%d)\n", ret);
+                return -1;
+        }
+        /* Adjust argc/argv past the EAL arguments */
+        argc -= ret;
+        argv += ret;
+#endif
 
         /* Initialize: parse args, set up UMEM, create XSK, load XDP prog */
         ret = afxdp_init(&ctx, argc, argv);

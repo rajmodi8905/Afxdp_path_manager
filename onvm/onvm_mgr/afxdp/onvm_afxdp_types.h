@@ -117,7 +117,8 @@ struct afxdp_stats_record {
         uint64_t rx_bytes;            /* Total RX bytes received */
         uint64_t tx_packets;          /* Total TX packets transmitted */
         uint64_t tx_bytes;            /* Total TX bytes transmitted */
-        uint64_t rx_dropped;          /* Packets dropped (no free UMEM frame) */
+        uint64_t rx_dropped;          /* Packets dropped on RX (no free UMEM frame / ring full) */
+        uint64_t tx_dropped;          /* Packets dropped on TX (XSK TX ring full) */
 };
 
 /**************************** XSK Socket Info *********************************/
@@ -147,9 +148,14 @@ struct afxdp_socket_info {
         /* libxdp socket handle */
         struct xsk_socket *xsk;
 
-        /* UMEM frame free-list (stack-based allocator) */
-        uint64_t umem_frame_addr[AFXDP_NUM_FRAMES];
-        uint32_t umem_frame_free;
+        /* UMEM frame free-list.
+         * In multi-threaded chain mode, we use an rte_ring (MPSC) so that
+         * the TX thread, NF threads, and RX thread can all push/pop
+         * frames without data races.  The rte_ring stores uint64_t
+         * addresses cast to (void *). */
+        uint64_t umem_frame_addr[AFXDP_NUM_FRAMES]; /* init-time bootstrap only */
+        uint32_t umem_frame_free;                    /* init-time bootstrap only */
+        void *umem_frame_ring;                       /* struct rte_ring * (MPSC) */
 
         /* Outstanding TX descriptors not yet completed by the kernel */
         uint32_t outstanding_tx;
@@ -186,6 +192,180 @@ struct afxdp_config {
         bool xsk_poll_mode;                   /* Use poll() instead of busy-wait */
         bool custom_xdp_prog;                 /* true if user supplied a custom .o */
         bool verbose;                         /* Enable verbose logging */
+
+        /* NF chain specification (comma-separated NF type names, from -C flag) */
+        char nf_chain_spec[512];
+        bool use_real_nfs;                    /* true when -C is provided */
+};
+
+/**************************** NF Chaining Types *******************************/
+
+/*
+ * Forward declarations for ring types.
+ * The actual struct is defined in onvm_afxdp_ring.h.
+ */
+struct afxdp_nf_ring;
+
+/*
+ * Ring backend selector.
+ * Phase-1 uses CUSTOM only (no DPDK linkage).
+ * When DPDK is linked, RTE backend can be selected.
+ */
+enum afxdp_ring_backend {
+        AFXDP_RING_BE_RTE    = AFXDP_RING_BACKEND_RTE,
+        AFXDP_RING_BE_CUSTOM = AFXDP_RING_BACKEND_CUSTOM,
+};
+
+/*
+ * Per-packet metadata carried through the NF chain.
+ * The NF handler sets `action` to decide what happens next.
+ */
+struct afxdp_pkt_meta {
+        uint8_t  action;          /* AFXDP_NF_ACTION_*                       */
+        uint8_t  chain_index;     /* Current position in the chain           */
+        uint16_t destination;     /* Target NF id (used with ACTION_TONF)    */
+        uint32_t flags;           /* Reserved for future per-packet flags    */
+};
+
+/*
+ * Descriptor linking a packet to its UMEM location.
+ * This is what the ring payload ultimately refers to.
+ */
+struct afxdp_nf_desc {
+        uint64_t umem_addr;       /* UMEM offset of the frame                */
+        uint32_t len;             /* Packet length in bytes                  */
+        uint32_t _pad;            /* Alignment padding                       */
+};
+
+/*
+ * Packet holder — the object placed inside NF rings.
+ * Combines the UMEM descriptor with NF routing metadata.
+ */
+struct afxdp_pkt_holder {
+        struct afxdp_nf_desc  desc;    /* UMEM address + frame length        */
+        struct afxdp_pkt_meta meta;    /* NF action / state metadata         */
+};
+
+/*
+ * Per-NF statistics counters.
+ */
+struct afxdp_nf_stats {
+        uint64_t rx_packets;      /* Packets dequeued from NF RX ring        */
+        uint64_t tx_packets;      /* Packets enqueued to NF TX ring          */
+        uint64_t rx_bytes;        /* Total bytes received by this NF         */
+        uint64_t tx_bytes;        /* Total bytes transmitted by this NF      */
+        uint64_t dropped;         /* Packets dropped by this NF              */
+};
+
+/*
+ * NF handler callback type.
+ * Called for each packet dequeued from the NF's RX ring.
+ * The handler inspects/modifies the packet and sets meta.action.
+ * Returns 0 on success, negative errno on error.
+ */
+struct afxdp_nf;  /* forward declaration */
+typedef int (*afxdp_nf_handler_fn)(struct afxdp_pkt_holder *pkt,
+                                   struct afxdp_nf *nf);
+
+/* Setup: called once when the NF thread starts (optional). */
+typedef int (*afxdp_nf_setup_fn)(struct afxdp_nf *nf);
+
+/* Teardown: called once when the NF thread exits (optional). */
+typedef void (*afxdp_nf_teardown_fn)(struct afxdp_nf *nf);
+
+/*
+ * NF function table — groups all callbacks for an NF type.
+ */
+struct afxdp_nf_function_table {
+        afxdp_nf_handler_fn   pkt_handler;    /* required */
+        afxdp_nf_setup_fn     setup;          /* optional, NULL = noop */
+        afxdp_nf_teardown_fn  teardown;       /* optional, NULL = noop */
+};
+
+/*
+ * NF instance — represents one network function in the chain.
+ */
+struct afxdp_nf {
+        uint16_t nf_id;                           /* Unique NF identifier    */
+        uint16_t chain_position;                  /* Position in chain (0-based) */
+
+        /* Custom SPSC ring pointers (Phase-1 active) */
+        struct afxdp_nf_ring *rx_ring_custom;     /* Packets waiting for NF  */
+        struct afxdp_nf_ring *tx_ring_custom;     /* Packets produced by NF  */
+
+        /* rte_ring pointers (Phase-2 — NULL in Phase-1) */
+        void *rx_ring;                            /* struct rte_ring * */
+        void *tx_ring;                            /* struct rte_ring * */
+
+        /* NF handler callback (used by Custom SPSC inline path) */
+        afxdp_nf_handler_fn handler;
+
+        /* Full function table (used by real NF threads) */
+        struct afxdp_nf_function_table *function_table;
+
+        /* UMEM buffer base — for raw packet data access */
+        void *packet_buffer;
+
+        /* NF-private state (e.g., firewall rules) */
+        void *nf_state;
+
+        /* Per-NF stats */
+        struct afxdp_nf_stats stats;
+
+        /* Is this NF slot active? */
+        bool active;
+};
+
+/*
+ * Service chain entry — maps a position to an NF id.
+ * Future-ready: not consumed in Phase-1 runtime path.
+ */
+struct afxdp_service_chain_entry {
+        uint16_t nf_id;           /* NF to invoke at this position           */
+        uint16_t _reserved;
+};
+
+/*
+ * Service chain definition.
+ * Future-ready: Phase-1 uses a simple linear array in chain_ctx instead.
+ */
+struct afxdp_service_chain {
+        char name[AFXDP_MAX_CHAIN_NAME_LEN];
+        struct afxdp_service_chain_entry entries[AFXDP_MAX_CHAIN_ENTRIES];
+        uint16_t length;          /* Number of active entries                */
+        uint16_t chain_id;
+        bool active;
+};
+
+/*
+ * Chain context — holds all NF chaining state.
+ * Owned by the manager context.
+ */
+struct afxdp_chain_ctx {
+        /* NF table (indexed by nf_id, supports up to AFXDP_MAX_NFS) */
+        struct afxdp_nf nfs[AFXDP_MAX_NFS];
+
+        /* Static chain order — nf_ids in execution sequence */
+        uint16_t chain_order[AFXDP_MAX_CHAIN_LENGTH];
+
+        /* Number of NFs in the active chain */
+        uint16_t chain_length;
+
+        /* Pre-allocated packet holder pool */
+        struct afxdp_pkt_holder *holder_pool;
+        uint32_t holder_pool_size;
+
+        /* MPSC free-list for holders (rte_ring: multi-producer enqueue, single-consumer dequeue) */
+        void *holder_free_ring;               /* struct rte_ring */
+
+        /* true when holder_pool is embedded in the UMEM hugepage buffer */
+        bool holder_pool_embedded;
+
+        /* Selected ring backend */
+        enum afxdp_ring_backend ring_backend;
+
+        /* Back-reference to XSK socket for UMEM frame reclamation on drop */
+        struct afxdp_socket_info *xsk;
 };
 
 /**************************** Manager Context *********************************/
@@ -211,6 +391,9 @@ struct afxdp_manager_ctx {
         volatile bool global_exit;
         bool use_hugepages;                   /* true → munmap; false → free()    */
         bool hugepage_preallocated;           /* pre-alloc'd before rte_eal_init()*/
+
+        /* NF Chaining (Phase-1) */
+        struct afxdp_chain_ctx *chain;        /* NULL when chaining is disabled   */
 };
 
 #endif /* _ONVM_AFXDP_TYPES_H_ */
