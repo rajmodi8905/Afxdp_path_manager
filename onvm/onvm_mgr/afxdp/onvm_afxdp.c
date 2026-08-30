@@ -66,6 +66,7 @@
 #include "onvm_afxdp_chain.h"
 
 #include <rte_ring.h>
+#include <rte_mempool.h>
 
 #include <sys/mman.h>    /* mmap, munmap, MAP_HUGETLB, MAP_ANONYMOUS */
 #include <sys/syscall.h> /* syscall, __NR_mbind                        */
@@ -155,7 +156,7 @@ afxdp_print_usage(const char *prog) {
                 "  -p              Use poll() instead of busy-wait\n"
                 "  -f <file.o>     Custom XDP kernel object file\n"
                 "  -P <progname>   XDP program section name\n"
-                "  -C <chain>      NF chain spec (comma-separated, e.g. "simple_forward,firewall")\n"
+                "  -C <chain>      NF chain spec (comma-separated, e.g. \"simple_forward,firewall\")\n"
                 "  -v              Verbose output (enable stats)\n"
                 "  -t <seconds>    Time to live (auto-shutdown)\n"
                 "  -l <packets>    Packet limit (auto-shutdown)\n"
@@ -424,7 +425,7 @@ afxdp_preallocate_hugepages(struct afxdp_manager_ctx *ctx) {
                 return 0;
         }
 
-        AFXDP_LOG_INFO("Pre-allocating UMEM buffer (%lu KB) "
+        AFXDP_LOG_INFO("Pre-allocating UMEM buffer (%llu KB) "
                        "before rte_eal_init()",
                        AFXDP_UMEM_HUGEPAGE_ALIGNED / 1024);
 
