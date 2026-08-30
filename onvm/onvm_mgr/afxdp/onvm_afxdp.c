@@ -90,7 +90,8 @@ static void afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv);
 static struct afxdp_umem_info *afxdp_configure_umem(void *buffer, uint64_t size);
 static struct afxdp_socket_info *afxdp_configure_socket(struct afxdp_manager_ctx *ctx,
                        const char *ifname, int xsk_map_fd,
-                       uint32_t slice_start, uint32_t slice_frames);
+                       uint32_t slice_start, uint32_t slice_frames,
+                       bool shared);
 void afxdp_complete_tx(struct afxdp_socket_info *xsk);
 static void afxdp_handle_receive(struct afxdp_manager_ctx *ctx);
 static void afxdp_rx_and_process(struct afxdp_manager_ctx *ctx);
@@ -838,7 +839,8 @@ afxdp_umem_free_frames(struct afxdp_socket_info *xsk) {
 static struct afxdp_socket_info *
 afxdp_configure_socket(struct afxdp_manager_ctx *ctx,
                        const char *ifname, int xsk_map_fd,
-                       uint32_t slice_start, uint32_t slice_frames) {
+                       uint32_t slice_start, uint32_t slice_frames,
+                       bool shared) {
         struct xsk_socket_config xsk_cfg;
         struct afxdp_socket_info *xsk_info;
         struct afxdp_config *cfg = &ctx->cfg;
@@ -869,12 +871,38 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx,
                 ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD
                 : 0;
 
-        /* Create the AF_XDP socket */
-        ret = xsk_socket__create(&xsk_info->xsk, ifname,
-                                 cfg->xsk_if_queue, ctx->umem->umem,
-                                 &xsk_info->rx, &xsk_info->tx, &xsk_cfg);
+        /*
+         * Create the AF_XDP socket.
+         *
+         * For the first socket on a UMEM, use xsk_socket__create() which
+         * registers the UMEM buffer with the kernel (setsockopt XDP_UMEM_REG).
+         *
+         * For subsequent sockets sharing the same UMEM, use
+         * xsk_socket__create_shared() which skips UMEM re-registration and
+         * instead shares via setsockopt(XDP_SHARED_UMEM).  This variant
+         * also sets up independent Fill and Completion rings per socket,
+         * which is required for DMA isolation between different NIC ports.
+         */
+        if (shared) {
+                ret = xsk_socket__create_shared(&xsk_info->xsk, ifname,
+                                                cfg->xsk_if_queue,
+                                                ctx->umem->umem,
+                                                &xsk_info->rx, &xsk_info->tx,
+                                                &xsk_info->own_fq,
+                                                &xsk_info->own_cq,
+                                                &xsk_cfg);
+                xsk_info->has_own_rings = true;
+        } else {
+                ret = xsk_socket__create(&xsk_info->xsk, ifname,
+                                         cfg->xsk_if_queue, ctx->umem->umem,
+                                         &xsk_info->rx, &xsk_info->tx,
+                                         &xsk_cfg);
+                xsk_info->has_own_rings = false;
+        }
         if (ret) {
-                AFXDP_LOG_ERR("xsk_socket__create failed: %s", strerror(-ret));
+                AFXDP_LOG_ERR("xsk_socket__%s failed: %s",
+                              shared ? "create_shared" : "create",
+                              strerror(-ret));
                 free(xsk_info);
                 return NULL;
         }
@@ -925,17 +953,18 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx,
          * Pre-populate the Fill Ring with empty buffers so the kernel
          * has frames to receive packets into immediately.
          */
-        ret = xsk_ring_prod__reserve(&xsk_info->umem->fq,
-                                     AFXDP_FILL_RING_SIZE, &idx);
-        if (ret != (int)AFXDP_FILL_RING_SIZE) {
-                AFXDP_LOG_ERR("Failed to reserve fill ring entries: got %d, need %u",
-                              ret, AFXDP_FILL_RING_SIZE);
-                xsk_socket__delete(xsk_info->xsk);
-                free(xsk_info);
-                return NULL;
-        }
-
         {
+                struct xsk_ring_prod *fq = AFXDP_XSK_FQ(xsk_info);
+
+                ret = xsk_ring_prod__reserve(fq,
+                                             AFXDP_FILL_RING_SIZE, &idx);
+                if (ret != (int)AFXDP_FILL_RING_SIZE) {
+                        AFXDP_LOG_ERR("Failed to reserve fill ring entries: got %d, need %u",
+                                      ret, AFXDP_FILL_RING_SIZE);
+                        xsk_socket__delete(xsk_info->xsk);
+                        free(xsk_info);
+                        return NULL;
+                }
 
                 uint32_t bootstrap_count = 0;
                 for (i = 0; i < AFXDP_FILL_RING_SIZE; i++) {
@@ -947,10 +976,10 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx,
                                               i, AFXDP_FILL_RING_SIZE);
                                 break;
                         }
-                        *xsk_ring_prod__fill_addr(&xsk_info->umem->fq, idx++) = frame;
+                        *xsk_ring_prod__fill_addr(fq, idx++) = frame;
                         bootstrap_count++;
                 }
-                xsk_ring_prod__submit(&xsk_info->umem->fq, bootstrap_count);
+                xsk_ring_prod__submit(fq, bootstrap_count);
         }
 
         AFXDP_LOG_INFO("AF_XDP socket created on %s queue %d",
@@ -992,17 +1021,20 @@ afxdp_complete_tx(struct afxdp_socket_info *xsk) {
         sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 
         /* Drain the Completion Ring: reclaim UMEM frames */
-        completed = xsk_ring_cons__peek(&xsk->umem->cq,
-                                        AFXDP_COMP_RING_SIZE, &idx_cq);
-        if (completed > 0) {
-                for (unsigned int i = 0; i < completed; i++) {
-                        afxdp_free_umem_frame(
-                                xsk,
-                                *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++));
+        {
+                struct xsk_ring_cons *cq = AFXDP_XSK_CQ(xsk);
+                completed = xsk_ring_cons__peek(cq,
+                                                AFXDP_COMP_RING_SIZE, &idx_cq);
+                if (completed > 0) {
+                        for (unsigned int i = 0; i < completed; i++) {
+                                afxdp_free_umem_frame(
+                                        xsk,
+                                        *xsk_ring_cons__comp_addr(cq, idx_cq++));
+                        }
+                        xsk_ring_cons__release(cq, completed);
+                        xsk->outstanding_tx -= (completed < xsk->outstanding_tx)
+                                ? completed : xsk->outstanding_tx;
                 }
-                xsk_ring_cons__release(&xsk->umem->cq, completed);
-                xsk->outstanding_tx -= (completed < xsk->outstanding_tx)
-                        ? completed : xsk->outstanding_tx;
         }
 }
 
@@ -1020,17 +1052,20 @@ afxdp_drain_cq(struct afxdp_socket_info *xsk) {
         if (!xsk->outstanding_tx)
                 return;
 
-        completed = xsk_ring_cons__peek(&xsk->umem->cq,
-                                        AFXDP_COMP_RING_SIZE, &idx_cq);
-        if (completed > 0) {
-                for (unsigned int i = 0; i < completed; i++) {
-                        afxdp_free_umem_frame(
-                                xsk,
-                                *xsk_ring_cons__comp_addr(&xsk->umem->cq, idx_cq++));
+        {
+                struct xsk_ring_cons *cq = AFXDP_XSK_CQ(xsk);
+                completed = xsk_ring_cons__peek(cq,
+                                                AFXDP_COMP_RING_SIZE, &idx_cq);
+                if (completed > 0) {
+                        for (unsigned int i = 0; i < completed; i++) {
+                                afxdp_free_umem_frame(
+                                        xsk,
+                                        *xsk_ring_cons__comp_addr(cq, idx_cq++));
+                        }
+                        xsk_ring_cons__release(cq, completed);
+                        xsk->outstanding_tx -= (completed < xsk->outstanding_tx)
+                                ? completed : xsk->outstanding_tx;
                 }
-                xsk_ring_cons__release(&xsk->umem->cq, completed);
-                xsk->outstanding_tx -= (completed < xsk->outstanding_tx)
-                        ? completed : xsk->outstanding_tx;
         }
 }
 
@@ -1188,25 +1223,28 @@ afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
          * next batch of incoming packets into. We push as many free
          * frames as we have available.
          */
-        stock_frames = xsk_prod_nb_free(&xsk->umem->fq,
-                                        afxdp_umem_free_frames(xsk));
-        if (stock_frames > 0) {
-                ret = xsk_ring_prod__reserve(&xsk->umem->fq,
-                                             stock_frames, &idx_fq);
-                /* Non-blocking: take what we can, don't spin-wait */
-                if (ret > 0) {
+        {
+                struct xsk_ring_prod *fq = AFXDP_XSK_FQ(xsk);
+                stock_frames = xsk_prod_nb_free(fq,
+                                                afxdp_umem_free_frames(xsk));
+                if (stock_frames > 0) {
+                        ret = xsk_ring_prod__reserve(fq,
+                                                     stock_frames, &idx_fq);
+                        /* Non-blocking: take what we can, don't spin-wait */
+                        if (ret > 0) {
 
-                        unsigned int submitted = 0;
-                        stock_frames = (unsigned int)ret;
-                        for (i = 0; i < stock_frames; i++) {
-                                uint64_t frame = afxdp_alloc_umem_frame(xsk);
-                                if (frame == AFXDP_INVALID_UMEM_FRAME)
-                                        break;
-                                *xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = frame;
-                                submitted++;
+                                unsigned int submitted = 0;
+                                stock_frames = (unsigned int)ret;
+                                for (i = 0; i < stock_frames; i++) {
+                                        uint64_t frame = afxdp_alloc_umem_frame(xsk);
+                                        if (frame == AFXDP_INVALID_UMEM_FRAME)
+                                                break;
+                                        *xsk_ring_prod__fill_addr(fq, idx_fq++) = frame;
+                                        submitted++;
+                                }
+                                if (submitted > 0)
+                                        xsk_ring_prod__submit(fq, submitted);
                         }
-                        if (submitted > 0)
-                                xsk_ring_prod__submit(&xsk->umem->fq, submitted);
                 }
         }
 
@@ -1897,7 +1935,7 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 }
                 ctx->xsk_socket = afxdp_configure_socket(
                         ctx, ctx->cfg.ifname, ctx->xsk_map_fd,
-                        s0_start, s0_frames);
+                        s0_start, s0_frames, false);
         }
         if (!ctx->xsk_socket) {
                 AFXDP_LOG_ERR("AF_XDP socket creation failed (Port 0)");
@@ -1963,7 +2001,7 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                                AFXDP_SLICE_B_START + AFXDP_SLICE_B_FRAMES - 1);
                 ctx->xsk_socket_dpdk = afxdp_configure_socket(
                         ctx, ctx->cfg.dpdk_ifname, ctx->xsk_map_fd_dpdk,
-                        AFXDP_SLICE_B_START, AFXDP_SLICE_B_FRAMES);
+                        AFXDP_SLICE_B_START, AFXDP_SLICE_B_FRAMES, true);
                 if (!ctx->xsk_socket_dpdk) {
                         AFXDP_LOG_ERR("AF_XDP socket creation failed (Port 1)");
                         return -ENODEV;

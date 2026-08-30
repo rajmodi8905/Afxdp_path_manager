@@ -160,19 +160,20 @@ combined_dpdk_rx(struct afxdp_manager_ctx *ctx,
          * has buffers available for new incoming packets.
          */
         {
-                unsigned int stock = xsk_prod_nb_free(&xsk->umem->fq,
+                struct xsk_ring_prod *fq = AFXDP_XSK_FQ(xsk);
+                unsigned int stock = xsk_prod_nb_free(fq,
                                                       rcvd);
                 if (stock > 0) {
                         int reserved = xsk_ring_prod__reserve(
-                                &xsk->umem->fq, stock, &idx_fq);
+                                fq, stock, &idx_fq);
                         for (int j = 0; j < reserved; j++) {
                                 uint64_t frame = afxdp_alloc_umem_frame(xsk);
                                 if (frame == AFXDP_INVALID_UMEM_FRAME)
                                         break;
-                                *xsk_ring_prod__fill_addr(&xsk->umem->fq,
+                                *xsk_ring_prod__fill_addr(fq,
                                                           idx_fq++) = frame;
                         }
-                        xsk_ring_prod__submit(&xsk->umem->fq, reserved);
+                        xsk_ring_prod__submit(fq, reserved);
                 }
         }
 

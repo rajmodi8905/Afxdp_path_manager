@@ -145,6 +145,17 @@ struct afxdp_socket_info {
         /* Back-reference to the shared UMEM */
         struct afxdp_umem_info *umem;
 
+        /* Per-socket Fill/Completion rings for shared-UMEM sockets.
+         * For the first socket (Socket 0), these are unused — it uses
+         * umem->fq / umem->cq that were set up by xsk_umem__create().
+         * For subsequent shared sockets (Socket 1+), xsk_socket__create_shared()
+         * sets up independent rings here so each port has isolated DMA
+         * buffer management.  Use the AFXDP_XSK_FQ / AFXDP_XSK_CQ macros
+         * to get the correct ring for a given socket. */
+        struct xsk_ring_prod own_fq;
+        struct xsk_ring_cons own_cq;
+        bool has_own_rings;    /* true when own_fq/own_cq are active */
+
         /* libxdp socket handle */
         struct xsk_socket *xsk;
 
@@ -166,6 +177,16 @@ struct afxdp_socket_info {
         /* Previous stats snapshot (for rate calculations) */
         struct afxdp_stats_record prev_stats;
 };
+
+/*
+ * Convenience macros: return the correct FQ / CQ pointer for a socket.
+ * Socket 0 (first socket):  uses umem->fq / umem->cq
+ * Socket 1+ (shared UMEM): uses own_fq / own_cq
+ */
+#define AFXDP_XSK_FQ(xsk) \
+        ((xsk)->has_own_rings ? &(xsk)->own_fq : &(xsk)->umem->fq)
+#define AFXDP_XSK_CQ(xsk) \
+        ((xsk)->has_own_rings ? &(xsk)->own_cq : &(xsk)->umem->cq)
 
 /**************************** Runtime Config **********************************/
 
