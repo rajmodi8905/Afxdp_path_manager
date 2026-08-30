@@ -87,8 +87,10 @@
 static int afxdp_preflight_checks(struct afxdp_config *cfg);
 static void afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv);
 static struct afxdp_umem_info *afxdp_configure_umem(void *buffer, uint64_t size);
-static struct afxdp_socket_info *afxdp_configure_socket(struct afxdp_manager_ctx *ctx);
-static void afxdp_complete_tx(struct afxdp_socket_info *xsk);
+static struct afxdp_socket_info *afxdp_configure_socket(struct afxdp_manager_ctx *ctx,
+                       const char *ifname, int xsk_map_fd,
+                       uint32_t slice_start, uint32_t slice_frames);
+void afxdp_complete_tx(struct afxdp_socket_info *xsk);
 static void afxdp_handle_receive(struct afxdp_manager_ctx *ctx);
 static void afxdp_rx_and_process(struct afxdp_manager_ctx *ctx);
 
@@ -101,7 +103,7 @@ static void *afxdp_mgr_thread_main(void *arg);
 static void *afxdp_wakeup_thread_main(void *arg);
 
 /* UMEM frame allocator */
-static uint64_t afxdp_alloc_umem_frame(struct afxdp_socket_info *xsk);
+uint64_t afxdp_alloc_umem_frame(struct afxdp_socket_info *xsk);
 void afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame);
 static uint64_t afxdp_umem_free_frames(struct afxdp_socket_info *xsk);
 
@@ -144,6 +146,7 @@ afxdp_print_usage(const char *prog) {
         fprintf(stderr,
                 "Usage: %s [options]\n"
                 "  -d <ifname>     Network interface to bind (required)\n"
+                "  -D <ifname>     DPDK port interface (combined mode, Port 1)\n"
                 "  -Q <queue_id>   RX queue index (default: %d)\n"
                 "  -S              SKB (generic) XDP mode\n"
                 "  -N              Native XDP mode\n"
@@ -152,7 +155,7 @@ afxdp_print_usage(const char *prog) {
                 "  -p              Use poll() instead of busy-wait\n"
                 "  -f <file.o>     Custom XDP kernel object file\n"
                 "  -P <progname>   XDP program section name\n"
-                "  -C <chain>      NF chain spec (comma-separated, e.g. \"simple_forward,firewall\")\n"
+                "  -C <chain>      NF chain spec (comma-separated, e.g. "simple_forward,firewall")\n"
                 "  -v              Verbose output (enable stats)\n"
                 "  -t <seconds>    Time to live (auto-shutdown)\n"
                 "  -l <packets>    Packet limit (auto-shutdown)\n"
@@ -183,10 +186,14 @@ afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv) {
         cfg->nf_chain_spec[0] = '\0';
         cfg->use_real_nfs = false;
 
+        cfg->combined_mode = false;
+        cfg->dpdk_ifname[0] = '\0';
+        cfg->dpdk_ifindex = -1;
+
         /* Reset getopt for re-entrant parsing (manager already parsed EAL args) */
         optind = 1;
 
-        while ((opt = getopt(argc, argv, "d:Q:SNczpf:P:vt:l:C:h")) != -1) {
+        while ((opt = getopt(argc, argv, "d:D:Q:SNczpf:P:vt:l:C:h")) != -1) {
                 switch (opt) {
                 case 'd':
                         strncpy(cfg->ifname, optarg, IF_NAMESIZE - 1);
@@ -233,6 +240,11 @@ afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv) {
                         cfg->nf_chain_spec[sizeof(cfg->nf_chain_spec) - 1] = '\0';
                         cfg->use_real_nfs = true;
                         break;
+                case 'D':
+                        strncpy(cfg->dpdk_ifname, optarg, IF_NAMESIZE - 1);
+                        cfg->dpdk_ifname[IF_NAMESIZE - 1] = '\0';
+                        cfg->combined_mode = true;
+                        break;
                 case 'h':
                 default:
                         afxdp_print_usage(argv[0]);
@@ -246,6 +258,15 @@ afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv) {
                 AFXDP_LOG_ERR("Cannot find interface '%s': %s",
                               cfg->ifname, strerror(errno));
                 exit(EXIT_FAILURE);
+        }
+
+        if (cfg->combined_mode) {
+                cfg->dpdk_ifindex = (int)if_nametoindex(cfg->dpdk_ifname);
+                if (cfg->dpdk_ifindex <= 0) {
+                        AFXDP_LOG_ERR("Cannot find DPDK interface '%s': %s",
+                                      cfg->dpdk_ifname, strerror(errno));
+                        exit(EXIT_FAILURE);
+                }
         }
 
         /* Default XDP program path if custom not specified */
@@ -263,6 +284,13 @@ afxdp_parse_args(struct afxdp_config *cfg, int argc, char **argv) {
         AFXDP_LOG_INFO("  XDP Prog:    %s", cfg->xdp_prog_name);
         AFXDP_LOG_INFO("  Poll Mode:   %s", cfg->xsk_poll_mode ? "yes" : "no");
         AFXDP_LOG_INFO("  Verbose:     %s", cfg->verbose ? "yes" : "no");
+        if (cfg->use_real_nfs)
+                AFXDP_LOG_INFO("  NF Chain:    %s", cfg->nf_chain_spec);
+        if (cfg->combined_mode) {
+                AFXDP_LOG_INFO("  Combined:    yes");
+                AFXDP_LOG_INFO("  DPDK Port:   %s (index %d)",
+                               cfg->dpdk_ifname, cfg->dpdk_ifindex);
+        }
         if (cfg->time_to_live)
                 AFXDP_LOG_INFO("  TTL:         %u seconds", cfg->time_to_live);
         if (cfg->pkt_limit)
@@ -762,7 +790,7 @@ afxdp_configure_umem(void *buffer, uint64_t size) {
  * Uses SC (single-consumer) dequeue — only the RX thread allocates.
  * Returns AFXDP_INVALID_UMEM_FRAME if pool is exhausted.
  */
-static uint64_t
+uint64_t
 afxdp_alloc_umem_frame(struct afxdp_socket_info *xsk) {
         void *addr_ptr = NULL;
         if (rte_ring_sc_dequeue((struct rte_ring *)xsk->umem_frame_ring,
@@ -807,7 +835,9 @@ afxdp_umem_free_frames(struct afxdp_socket_info *xsk) {
  ****************************************************************************/
 
 static struct afxdp_socket_info *
-afxdp_configure_socket(struct afxdp_manager_ctx *ctx) {
+afxdp_configure_socket(struct afxdp_manager_ctx *ctx,
+                       const char *ifname, int xsk_map_fd,
+                       uint32_t slice_start, uint32_t slice_frames) {
         struct xsk_socket_config xsk_cfg;
         struct afxdp_socket_info *xsk_info;
         struct afxdp_config *cfg = &ctx->cfg;
@@ -839,7 +869,7 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx) {
                 : 0;
 
         /* Create the AF_XDP socket */
-        ret = xsk_socket__create(&xsk_info->xsk, cfg->ifname,
+        ret = xsk_socket__create(&xsk_info->xsk, ifname,
                                  cfg->xsk_if_queue, ctx->umem->umem,
                                  &xsk_info->rx, &xsk_info->tx, &xsk_cfg);
         if (ret) {
@@ -853,7 +883,7 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx) {
          * into the XSKMAP so the kernel program can redirect to it.
          */
         if (cfg->custom_xdp_prog) {
-                ret = xsk_socket__update_xskmap(xsk_info->xsk, ctx->xsk_map_fd);
+                ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
                 if (ret) {
                         AFXDP_LOG_ERR("xsk_socket__update_xskmap failed: %s",
                                       strerror(-ret));
@@ -861,25 +891,29 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx) {
                         free(xsk_info);
                         return NULL;
                 }
-                AFXDP_LOG_INFO("Socket inserted into XSKMAP (fd=%d)", ctx->xsk_map_fd);
+                AFXDP_LOG_INFO("Socket inserted into XSKMAP (fd=%d)", xsk_map_fd);
         }
 
         /* Initialize thread-safe UMEM frame allocator (rte_ring MPSC).
-         * Ring size must be power-of-2 and > NUM_FRAMES.
+         * Ring size must be power-of-2 and > slice_frames.
          * RING_F_SC_DEQ: only the RX thread dequeues (alloc).
          * Default (MP) enqueue: TX, NF, and RX threads can all free. */
         {
-                uint32_t ring_sz = AFXDP_NUM_FRAMES * 2; /* power-of-2, fits all */
+                uint32_t ring_sz = slice_frames * 2; /* power-of-2, fits all */
+                char ring_name[64];
+                snprintf(ring_name, sizeof(ring_name),
+                         "afxdp_umem_frames_%u", slice_start);
                 xsk_info->umem_frame_ring = rte_ring_create(
-                        "afxdp_umem_frames", ring_sz,
+                        ring_name, ring_sz,
                         rte_socket_id(), RING_F_SC_DEQ);
                 if (!xsk_info->umem_frame_ring) {
-                        AFXDP_LOG_ERR("Failed to create UMEM frame ring");
+                        AFXDP_LOG_ERR("Failed to create UMEM frame ring '%s'",
+                                      ring_name);
                         xsk_socket__delete(xsk_info->xsk);
                         free(xsk_info);
                         return NULL;
                 }
-                for (i = 0; i < AFXDP_NUM_FRAMES; i++) {
+                for (i = slice_start; i < slice_start + slice_frames; i++) {
                         rte_ring_mp_enqueue(
                                 (struct rte_ring *)xsk_info->umem_frame_ring,
                                 (void *)(uintptr_t)(i * AFXDP_FRAME_SIZE));
@@ -919,13 +953,14 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx) {
         }
 
         AFXDP_LOG_INFO("AF_XDP socket created on %s queue %d",
-                       cfg->ifname, cfg->xsk_if_queue);
+                       ifname, cfg->xsk_if_queue);
         AFXDP_LOG_INFO("  RX ring: %u  TX ring: %u  Fill ring: %u  Comp ring: %u",
                        AFXDP_RX_RING_SIZE, AFXDP_TX_RING_SIZE,
                        AFXDP_FILL_RING_SIZE, AFXDP_COMP_RING_SIZE);
-        AFXDP_LOG_INFO("  UMEM frames: %u × %u bytes = %lu KB total",
-                       AFXDP_NUM_FRAMES, AFXDP_FRAME_SIZE,
-                       ((unsigned long)AFXDP_NUM_FRAMES * AFXDP_FRAME_SIZE) / 1024);
+        AFXDP_LOG_INFO("  UMEM slice: frames %u..%u (%u frames, %lu KB)",
+                       slice_start, slice_start + slice_frames - 1,
+                       slice_frames,
+                       ((unsigned long)slice_frames * AFXDP_FRAME_SIZE) / 1024);
 
         return xsk_info;
 }
@@ -941,7 +976,7 @@ afxdp_configure_socket(struct afxdp_manager_ctx *ctx) {
  *
  ****************************************************************************/
 
-static void
+void
 afxdp_complete_tx(struct afxdp_socket_info *xsk) {
         unsigned int completed;
         uint32_t idx_cq;
@@ -1360,7 +1395,7 @@ afxdp_stats_print(struct afxdp_stats_record *stats,
         printf("\n");
 }
 
-static void
+void
 afxdp_set_thread_affinity(int core_id) {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
@@ -1842,19 +1877,98 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 return -ENOMEM;
         }
 
-        /* ---- Step 8: Create AF_XDP socket ---- */
-        ctx->xsk_socket = afxdp_configure_socket(ctx);
+        /* ---- Step 8: Create AF_XDP Socket 0 (Port 0) ---- */
+        {
+                /*
+                 * In combined mode, Socket 0 only gets Slice A frames.
+                 * In standalone mode, Socket 0 gets ALL frames.
+                 */
+                uint32_t s0_start, s0_frames;
+                if (ctx->cfg.combined_mode) {
+                        s0_start  = AFXDP_SLICE_A_START;
+                        s0_frames = AFXDP_SLICE_A_FRAMES;
+                        AFXDP_LOG_INFO("Combined mode: Socket 0 → Slice A "
+                                       "(frames %u..%u)",
+                                       s0_start, s0_start + s0_frames - 1);
+                } else {
+                        s0_start  = 0;
+                        s0_frames = AFXDP_NUM_FRAMES;
+                }
+                ctx->xsk_socket = afxdp_configure_socket(
+                        ctx, ctx->cfg.ifname, ctx->xsk_map_fd,
+                        s0_start, s0_frames);
+        }
         if (!ctx->xsk_socket) {
-                AFXDP_LOG_ERR("AF_XDP socket creation failed");
+                AFXDP_LOG_ERR("AF_XDP socket creation failed (Port 0)");
                 xsk_umem__delete(ctx->umem->umem);
                 free(ctx->umem);
                 ctx->umem = NULL;
-                /* Buffer freed by caller via afxdp_cleanup(ctx, true) */
                 return -ENODEV;
         }
 
         /* ---- Step 9: Print hugepage status report ---- */
         afxdp_print_hugepage_status(ctx);
+
+        /* ---- Step 9b: Combined Mode — Load XDP + create Socket 1 on Port 1 ---- */
+        if (ctx->cfg.combined_mode) {
+                AFXDP_LOG_INFO("--- Combined Mode: Initializing Port 1 ---");
+
+                /* Load XDP program on Port 1 */
+                AFXDP_LOG_INFO("Loading XDP program on Port 1: %s",
+                               ctx->cfg.dpdk_ifname);
+                DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts_dpdk,
+                        .open_filename = ctx->cfg.xdp_obj_file,
+                        .prog_name = ctx->cfg.xdp_prog_name,
+                );
+                ctx->xdp_prog_dpdk = xdp_program__create(&xdp_opts_dpdk);
+                err = libxdp_get_error(ctx->xdp_prog_dpdk);
+                if (err) {
+                        libxdp_strerror(err, errmsg, sizeof(errmsg));
+                        AFXDP_LOG_ERR("Failed to load XDP program for Port 1: %s",
+                                      errmsg);
+                        return -err;
+                }
+                err = xdp_program__attach(ctx->xdp_prog_dpdk,
+                                          ctx->cfg.dpdk_ifindex,
+                                          ctx->cfg.attach_mode, 0);
+                if (err) {
+                        libxdp_strerror(err, errmsg, sizeof(errmsg));
+                        AFXDP_LOG_ERR("Failed to attach XDP to Port 1 (%s): %s",
+                                      ctx->cfg.dpdk_ifname, errmsg);
+                        return err;
+                }
+                AFXDP_LOG_INFO("XDP program attached to Port 1: %s",
+                               ctx->cfg.dpdk_ifname);
+
+                /* Find xsks_map for Port 1 */
+                {
+                        struct bpf_map *map_dpdk;
+                        map_dpdk = bpf_object__find_map_by_name(
+                                xdp_program__bpf_obj(ctx->xdp_prog_dpdk),
+                                "xsks_map");
+                        ctx->xsk_map_fd_dpdk = bpf_map__fd(map_dpdk);
+                        if (ctx->xsk_map_fd_dpdk < 0) {
+                                AFXDP_LOG_ERR("Cannot find xsks_map for Port 1");
+                                return -ENOENT;
+                        }
+                        AFXDP_LOG_INFO("Found xsks_map for Port 1 (fd=%d)",
+                                       ctx->xsk_map_fd_dpdk);
+                }
+
+                /* Create AF_XDP Socket 1 with Slice B frames */
+                AFXDP_LOG_INFO("Combined mode: Socket 1 → Slice B "
+                               "(frames %u..%u)",
+                               AFXDP_SLICE_B_START,
+                               AFXDP_SLICE_B_START + AFXDP_SLICE_B_FRAMES - 1);
+                ctx->xsk_socket_dpdk = afxdp_configure_socket(
+                        ctx, ctx->cfg.dpdk_ifname, ctx->xsk_map_fd_dpdk,
+                        AFXDP_SLICE_B_START, AFXDP_SLICE_B_FRAMES);
+                if (!ctx->xsk_socket_dpdk) {
+                        AFXDP_LOG_ERR("AF_XDP socket creation failed (Port 1)");
+                        return -ENODEV;
+                }
+                AFXDP_LOG_INFO("--- Port 1 Initialization Complete ---");
+        }
 
         /* ---- Step 10: Initialize NF chain ---- */
         {
@@ -1874,7 +1988,10 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
         /* Worker threads are launched in afxdp_run(). */
 
         AFXDP_LOG_INFO("========================================");
-        AFXDP_LOG_INFO("  AF_XDP Manager Initialization Complete");
+        if (ctx->cfg.combined_mode)
+                AFXDP_LOG_INFO("  Combined DPDK+AF_XDP Init Complete");
+        else
+                AFXDP_LOG_INFO("  AF_XDP Manager Initialization Complete");
         AFXDP_LOG_INFO("========================================");
 
         return 0;
@@ -2037,7 +2154,44 @@ afxdp_cleanup(struct afxdp_manager_ctx *ctx, bool final_cleanup) {
                        ctx->xsk_socket->stats.tx_bytes);
         }
 
-        /* Detach and unload XDP program from the interface */
+        /* ---- Combined Mode: Tear down Port 1 resources ---- */
+        if (ctx->cfg.combined_mode) {
+                /* Detach XDP from Port 1 */
+                if (ctx->xdp_prog_dpdk) {
+                        err = xdp_program__detach(ctx->xdp_prog_dpdk,
+                                                  ctx->cfg.dpdk_ifindex,
+                                                  ctx->cfg.attach_mode, 0);
+                        if (err) {
+                                libxdp_strerror(err, errmsg, sizeof(errmsg));
+                                AFXDP_LOG_WARN("Failed to detach XDP from Port 1: %s",
+                                               errmsg);
+                        }
+                        xdp_program__close(ctx->xdp_prog_dpdk);
+                        ctx->xdp_prog_dpdk = NULL;
+                        AFXDP_LOG_INFO("XDP program detached from Port 1: %s",
+                                       ctx->cfg.dpdk_ifname);
+                }
+
+                /* Delete Socket 1 */
+                if (ctx->xsk_socket_dpdk) {
+                        if (ctx->xsk_socket_dpdk->umem_frame_ring)
+                                rte_ring_free((struct rte_ring *)
+                                              ctx->xsk_socket_dpdk->umem_frame_ring);
+                        xsk_socket__delete(ctx->xsk_socket_dpdk->xsk);
+                        free(ctx->xsk_socket_dpdk);
+                        ctx->xsk_socket_dpdk = NULL;
+                }
+
+                /* Free DPDK mempool */
+                if (ctx->dpdk_mempool) {
+                        rte_mempool_free(ctx->dpdk_mempool);
+                        ctx->dpdk_mempool = NULL;
+                }
+
+                AFXDP_LOG_INFO("Port 1 cleanup complete");
+        }
+
+        /* Detach and unload XDP program from Port 0 */
         if (ctx->xdp_prog) {
                 err = xdp_program__detach(ctx->xdp_prog, ctx->cfg.ifindex,
                                           ctx->cfg.attach_mode, 0);

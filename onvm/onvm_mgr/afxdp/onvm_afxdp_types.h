@@ -196,6 +196,12 @@ struct afxdp_config {
         /* NF chain specification (comma-separated NF type names, from -C flag) */
         char nf_chain_spec[512];
         bool use_real_nfs;                    /* true when -C is provided */
+
+        /* Combined architecture: DPDK port (Port 1) configuration.
+         * Only used when USE_COMBINED is defined (-D flag). */
+        char dpdk_ifname[IF_NAMESIZE];        /* Port 1 interface name        */
+        int  dpdk_ifindex;                    /* Port 1 interface index       */
+        bool combined_mode;                   /* true when -D is provided     */
 };
 
 /**************************** NF Chaining Types *******************************/
@@ -394,6 +400,17 @@ struct afxdp_manager_ctx {
 
         /* NF Chaining (Phase-1) */
         struct afxdp_chain_ctx *chain;        /* NULL when chaining is disabled   */
+
+        /* ---- Combined Architecture (Port 1 / DPDK) ---- */
+        struct afxdp_socket_info *xsk_socket_dpdk;   /* AF_XDP Socket 1 (Slice B)  */
+        struct xdp_program       *xdp_prog_dpdk;     /* XDP program on Port 1      */
+        int                       xsk_map_fd_dpdk;   /* xsks_map fd for Port 1     */
+
+#ifdef USE_COMBINED
+        struct rte_mempool       *dpdk_mempool;      /* rte_mbuf pool for NF IPC   */
+#else
+        void                     *dpdk_mempool;      /* placeholder when not combined */
+#endif
 };
 
 #endif /* _ONVM_AFXDP_TYPES_H_ */

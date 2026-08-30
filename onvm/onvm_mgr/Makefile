@@ -78,6 +78,20 @@ all: bpf
 bpf:
 	$(MAKE) -C $(ONVM_MGR_DIR)/afxdp
 
+# ---- COMBINED MODE (AF_XDP + DPDK wrapper) ---------------------------------
+else ifeq ($(MODE),COMBINED)
+APP = onvm_mgr_combined
+SRCS-y := main.c afxdp/onvm_afxdp.c afxdp/onvm_afxdp_ring.c afxdp/onvm_afxdp_chain.c afxdp/onvm_afxdp_nf_registry.c afxdp/nfs/afxdp_simple_forward.c afxdp/onvm_combined_dpdk.c
+
+CFLAGS += -O2 -Wall -Wextra -DUSE_COMBINED -DUSE_AFXDP -I$(ONVM_MGR_DIR)/afxdp
+LDFLAGS += -lxdp -lbpf -lelf -lz -lpthread
+
+all: bpf
+
+.PHONY: bpf
+bpf:
+	$(MAKE) -C $(ONVM_MGR_DIR)/afxdp
+
 # ---- DPDK MODE (original) --------------------------------------------------
 else
 

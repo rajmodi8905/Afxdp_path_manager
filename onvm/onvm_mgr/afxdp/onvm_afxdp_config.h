@@ -212,6 +212,18 @@
  * Phase-1: 1 (shared ingress/egress). Future: 2 (separate). */
 #define AFXDP_CHAIN_NUM_SOCKETS      1
 
+/**********************Combined Architecture (Silo Partitioning)*************/
+
+/* In combined mode, the UMEM is split into two non-overlapping slices:
+ *   Slice A: frames [0, SLICE_A_FRAMES)           — AF_XDP Port 0
+ *   Slice B: frames [SLICE_A_FRAMES, NUM_FRAMES)  — DPDK Port 1
+ * Each port's Fill Ring is populated ONLY with offsets from its slice,
+ * ensuring no DMA collision between the two NIC ports. */
+#define AFXDP_SLICE_A_START          0
+#define AFXDP_SLICE_A_FRAMES         (AFXDP_NUM_FRAMES / 2)  /* 32768 */
+#define AFXDP_SLICE_B_START          (AFXDP_NUM_FRAMES / 2)
+#define AFXDP_SLICE_B_FRAMES         (AFXDP_NUM_FRAMES / 2)  /* 32768 */
+
 /**********************Phase-2/3 Future-Ready Parameters*********************/
 
 /* Maximum number of independent service chains. */

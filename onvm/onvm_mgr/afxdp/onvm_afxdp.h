@@ -160,4 +160,19 @@ int afxdp_run(struct afxdp_manager_ctx *ctx);
  */
 void afxdp_cleanup(struct afxdp_manager_ctx *ctx, bool final_cleanup);
 
+/************************* Internal Helpers **********************************/
+/* These are used by onvm_combined_dpdk.c for the combined architecture. */
+
+/** Allocate a free UMEM frame from the socket's frame pool. */
+uint64_t afxdp_alloc_umem_frame(struct afxdp_socket_info *xsk);
+
+/** Return a UMEM frame to the socket's frame pool. */
+void afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame);
+
+/** Complete outstanding TX operations and reclaim UMEM frames. */
+void afxdp_complete_tx(struct afxdp_socket_info *xsk);
+
+/** Pin the calling thread to a specific CPU core. */
+void afxdp_set_thread_affinity(int core_id);
+
 #endif /* _ONVM_AFXDP_H_ */

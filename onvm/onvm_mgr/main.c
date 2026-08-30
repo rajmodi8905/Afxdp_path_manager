@@ -59,6 +59,9 @@
 /* AF_XDP mode: AF_XDP manager header */
 #include "afxdp/onvm_afxdp.h"
 #include <rte_eal.h>
+#ifdef USE_COMBINED
+#include "afxdp/onvm_combined_dpdk.h"
+#endif
 
 #else
 /* DPDK mode: full openNetVM manager headers */
@@ -370,12 +373,16 @@ main(int argc, char *argv[]) {
 
 #ifdef USE_AFXDP
         /******************************************************************
-         *  AF_XDP MODE
+         *  AF_XDP MODE (and COMBINED MODE)
          *
          *  Replace the entire DPDK manager pipeline with AF_XDP sockets.
          *  The XDP kernel program steers packets from the NIC into
          *  userspace via XSKMAP + bpf_redirect_map(). The userspace
          *  manager polls the AF_XDP RX ring and processes packets.
+         *
+         *  In COMBINED mode, a second AF_XDP socket (Socket 1) is
+         *  created on Port 1 with a thin wrapper that converts between
+         *  UMEM frames and rte_mbufs for openNetVM NF interoperability.
          ******************************************************************/
         struct afxdp_manager_ctx ctx;
         int ret;
@@ -395,14 +402,47 @@ main(int argc, char *argv[]) {
         argv += ret;
 #endif
 
-        /* Initialize: parse args, set up UMEM, create XSK, load XDP prog */
+        /* Initialize: parse args, set up UMEM, create XSK, load XDP prog.
+         * In combined mode, this also creates Socket 1 on Port 1 with
+         * Slice B frames and loads XDP on Port 1. */
         ret = afxdp_init(&ctx, argc, argv);
         if (ret < 0) {
                 fprintf(stderr, "AF_XDP initialization failed (err=%d)\n", ret);
                 return -1;
         }
 
-        /* Enter the main polling loop (blocks until shutdown signal) */
+#ifdef USE_COMBINED
+        /* ---- Combined Mode: Initialize DPDK wrapper ---- */
+        if (ctx.cfg.combined_mode) {
+
+                /* Create rte_mempool for rte_mbuf wrappers */
+                ret = combined_dpdk_init(&ctx);
+                if (ret < 0) {
+                        fprintf(stderr, "Combined DPDK init failed (err=%d)\n",
+                                ret);
+                        afxdp_cleanup(&ctx, true);
+                        return -1;
+                }
+
+                /* Launch DPDK RX thread for Port 1.
+                 * Phase 1: simple loopback (RX -> TX on same port).
+                 * Phase 2: will route to openNetVM NFs via rte_ring. */
+                {
+                        pthread_t dpdk_rx_tid;
+                        if (pthread_create(&dpdk_rx_tid, NULL,
+                                           combined_dpdk_rx_thread, &ctx) != 0) {
+                                fprintf(stderr, "Failed to create DPDK RX thread\n");
+                                afxdp_cleanup(&ctx, true);
+                                return -1;
+                        }
+                        pthread_detach(dpdk_rx_tid);
+                        fprintf(stdout, "[COMBINED] DPDK RX thread launched\n");
+                }
+        }
+#endif /* USE_COMBINED */
+
+        /* Enter the main polling loop (blocks until shutdown signal).
+         * This handles Port 0's AF_XDP RX/TX and NF chain processing. */
         ret = afxdp_run(&ctx);
 
         /* Cleanup: detach XDP, delete socket, free UMEM (final exit) */
