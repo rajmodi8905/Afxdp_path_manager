@@ -1166,7 +1166,7 @@ static void
 afxdp_handle_receive(struct afxdp_manager_ctx *ctx) {
         struct afxdp_socket_info *xsk = ctx->xsk_socket;
         unsigned int rcvd, stock_frames, i;
-        uint32_t idx_rx = 0, idx_fq = 0, idx_tx = 0;
+        uint32_t idx_rx = 0, idx_fq = 0;
         int ret;
 
         /*
