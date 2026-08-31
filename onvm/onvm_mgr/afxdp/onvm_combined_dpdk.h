@@ -135,10 +135,21 @@ uint16_t combined_dpdk_tx(struct afxdp_manager_ctx *ctx,
 void *combined_dpdk_rx_thread(void *arg);
 
 /**
- * DPDK TX thread — drains openNetVM NF tx_q, sends via Socket 1 TX ring.
+ * DPDK TX thread — drains Port 1 NF tx_q, sends via Socket 1 TX ring.
  *
  * Thread entry point. Pins to AFXDP_BASE_CORE + 5.
  */
 void *combined_dpdk_tx_thread(void *arg);
+
+/**
+ * DPDK NF thread — runs a dummy NF on Port 1's NF chain.
+ *
+ * Dequeues rte_mbuf pointers from the NF's rx_ring, "processes" them
+ * (sets ACTION_NEXT), and enqueues to tx_ring. Uses the same thread
+ * arg struct as afxdp_dummy_nf_arg.
+ *
+ * Thread entry point. Pins to AFXDP_BASE_CORE + 6 + nf_idx.
+ */
+void *combined_dpdk_nf_thread(void *arg);
 
 #endif /* _ONVM_COMBINED_DPDK_H_ */

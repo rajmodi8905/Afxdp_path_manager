@@ -83,20 +83,33 @@ afxdp_free_umem_frame(struct afxdp_socket_info *xsk, uint64_t frame);
 /******************************** Chain API ************************************/
 
 /**
- * Initialize the NF chain.
+ * Initialize an NF chain.
  *
- * Allocates the chain context, creates per-NF SPSC rings, pre-allocates
- * the packet holder pool, and registers NF handler callbacks.
+ * Allocates the chain context, creates per-NF SPSC rings, optionally
+ * pre-allocates the packet holder pool, and registers NF handler callbacks.
  *
  * @param ctx
- *   Manager context. On success, ctx->chain is set.
+ *   Manager context (used for packet_buffer when embedding holder pool).
  * @param num_nfs
- *   Number of NFs in the static chain (e.g. 2 for simple_forward × 2).
+ *   Number of NFs in the static chain.
+ * @param out_chain
+ *   Output pointer — the newly created chain context is stored here.
+ * @param xsk
+ *   Back-reference to the XSK socket used for UMEM frame reclamation.
+ * @param label
+ *   Human-readable label for stats display (e.g., "Port 0 (AF_XDP)").
+ * @param needs_holders
+ *   If true, allocate the packet holder pool. Set false for DPDK chains
+ *   that use rte_mbuf instead of afxdp_pkt_holder.
  * @return
  *   0 on success, negative errno on failure.
  */
 int
-afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs);
+afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs,
+                 struct afxdp_chain_ctx **out_chain,
+                 struct afxdp_socket_info *xsk,
+                 const char *label,
+                 bool needs_holders);
 
 /**
  * Forward packets through the NF chain.
@@ -132,13 +145,16 @@ afxdp_chain_print_stats(const struct afxdp_chain_ctx *chain);
  * Tear down all chaining resources.
  *
  * Frees all rings, the holder pool, and the chain context itself.
- * Sets ctx->chain to NULL.
+ * Sets *chain_ptr to NULL.
+ *
+ * @param chain_ptr
+ *   Pointer to the chain pointer to tear down (e.g., &ctx->chain).
  */
 void
-afxdp_chain_teardown(struct afxdp_manager_ctx *ctx);
+afxdp_chain_teardown(struct afxdp_chain_ctx **chain_ptr);
 
 /**
- * Initialize the NF chain from a comma-separated NF type spec string.
+ * Initialize an NF chain from a comma-separated NF type spec string.
  *
  * Tokenizes the spec (e.g. "simple_forward,firewall"), looks up each
  * NF type in the registry, and assigns the handler function table.
@@ -147,10 +163,22 @@ afxdp_chain_teardown(struct afxdp_manager_ctx *ctx);
  *   Manager context.
  * @param spec
  *   Comma-separated NF type names.
+ * @param out_chain
+ *   Output pointer — the newly created chain context is stored here.
+ * @param xsk
+ *   Back-reference to the XSK socket.
+ * @param label
+ *   Human-readable label for stats display.
+ * @param needs_holders
+ *   If true, allocate holder pool.
  * @return
  *   0 on success, negative errno on failure.
  */
 int
-afxdp_chain_init_from_spec(struct afxdp_manager_ctx *ctx, const char *spec);
+afxdp_chain_init_from_spec(struct afxdp_manager_ctx *ctx, const char *spec,
+                           struct afxdp_chain_ctx **out_chain,
+                           struct afxdp_socket_info *xsk,
+                           const char *label,
+                           bool needs_holders);
 
 #endif /* _ONVM_AFXDP_CHAIN_H_ */

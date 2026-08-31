@@ -81,7 +81,11 @@ afxdp_holder_free(struct afxdp_chain_ctx *chain,
 /******************************* Chain Init ************************************/
 
 int
-afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
+afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs,
+                 struct afxdp_chain_ctx **out_chain,
+                 struct afxdp_socket_info *xsk,
+                 const char *label,
+                 bool needs_holders) {
         struct afxdp_chain_ctx *chain;
         uint16_t i;
 
@@ -98,40 +102,48 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
                 return -ENOMEM;
         }
 
+        strncpy(chain->label, label ? label : "Default", sizeof(chain->label) - 1);
         chain->chain_length = num_nfs;
         chain->ring_backend = AFXDP_DEFAULT_RING_BACKEND;
-        chain->xsk = ctx->xsk_socket;
+        chain->xsk = xsk;
 
-        /* ---- Set up packet holder pool ---- */
-        chain->holder_pool_size = AFXDP_PKT_HOLDER_POOL_SIZE;
+        /* ---- Set up packet holder pool (only for AF_XDP chains) ---- */
+        if (needs_holders) {
+                chain->holder_pool_size = AFXDP_PKT_HOLDER_POOL_SIZE;
 
-        if (ctx->packet_buffer) {
-                /* Embed the holder pool in the tail of the hugepage buffer, right after the UMEM frames */
-                chain->holder_pool = (struct afxdp_pkt_holder *)((uint8_t *)ctx->packet_buffer + AFXDP_UMEM_TOTAL_BYTES);
-                chain->holder_pool_embedded = true;
-                memset(chain->holder_pool, 0, chain->holder_pool_size * sizeof(struct afxdp_pkt_holder));
-        } else {
-                /* Fallback to heap allocation */
-                chain->holder_pool = (struct afxdp_pkt_holder *)calloc(
-                        chain->holder_pool_size, sizeof(struct afxdp_pkt_holder));
-                if (!chain->holder_pool) {
-                        AFXDP_LOG_ERR("Chain init: failed to allocate holder pool (%u entries)",
-                                      chain->holder_pool_size);
-                        free(chain);
-                        return -ENOMEM;
+                if (ctx->packet_buffer) {
+                        /* Embed the holder pool in the tail of the hugepage buffer */
+                        chain->holder_pool = (struct afxdp_pkt_holder *)(
+                                (uint8_t *)ctx->packet_buffer + AFXDP_UMEM_TOTAL_BYTES);
+                        chain->holder_pool_embedded = true;
+                        memset(chain->holder_pool, 0,
+                               chain->holder_pool_size * sizeof(struct afxdp_pkt_holder));
+                } else {
+                        /* Fallback to heap allocation */
+                        chain->holder_pool = (struct afxdp_pkt_holder *)calloc(
+                                chain->holder_pool_size, sizeof(struct afxdp_pkt_holder));
+                        if (!chain->holder_pool) {
+                                AFXDP_LOG_ERR("Chain init: failed to allocate holder pool");
+                                free(chain);
+                                return -ENOMEM;
+                        }
+                        chain->holder_pool_embedded = false;
                 }
+        } else {
+                chain->holder_pool = NULL;
+                chain->holder_pool_size = 0;
                 chain->holder_pool_embedded = false;
         }
 
-        /* Create rte_ring-based MPSC free-list.
-         * SC dequeue: only the RX thread calls afxdp_holder_alloc.
-         * MP enqueue: RX, TX, and NF threads all call afxdp_holder_free. */
-        {
-                /* rte_ring usable count = size - 1; double pool_size
-                 * to guarantee enough capacity for all holders. */
+        /* Create rte_ring-based MPSC free-list for holders.
+         * Skipped for DPDK chains that use rte_mbuf instead. */
+        if (needs_holders) {
                 uint32_t ring_sz = chain->holder_pool_size * 2;
+                char ring_name[64];
+                snprintf(ring_name, sizeof(ring_name),
+                         "%.32s_holder_free", chain->label);
                 chain->holder_free_ring = rte_ring_create(
-                        "afxdp_holder_free", ring_sz,
+                        ring_name, ring_sz,
                         rte_socket_id(), RING_F_SC_DEQ);
                 if (!chain->holder_free_ring) {
                         AFXDP_LOG_ERR("Chain init: failed to create holder free ring");
@@ -140,19 +152,24 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
                         free(chain);
                         return -ENOMEM;
                 }
-        }
 
-        /* Populate free ring — all holders start as free */
-        for (uint32_t j = 0; j < chain->holder_pool_size; j++) {
-                rte_ring_enqueue((struct rte_ring *)chain->holder_free_ring,
-                                 &chain->holder_pool[j]);
-        }
+                /* Populate free ring */
+                for (uint32_t j = 0; j < chain->holder_pool_size; j++) {
+                        rte_ring_enqueue((struct rte_ring *)chain->holder_free_ring,
+                                         &chain->holder_pool[j]);
+                }
 
-        AFXDP_LOG_INFO("Chain: holder pool %s (%u holders, %lu bytes each)",
-                       chain->holder_pool_embedded
-                           ? "embedded in UMEM buffer" : "heap-allocated",
-                       chain->holder_pool_size,
-                       (unsigned long)sizeof(struct afxdp_pkt_holder));
+                AFXDP_LOG_INFO("Chain [%s]: holder pool %s (%u holders, %lu bytes each)",
+                               chain->label,
+                               chain->holder_pool_embedded
+                                   ? "embedded in UMEM buffer" : "heap-allocated",
+                               chain->holder_pool_size,
+                               (unsigned long)sizeof(struct afxdp_pkt_holder));
+        } else {
+                chain->holder_free_ring = NULL;
+                AFXDP_LOG_INFO("Chain [%s]: no holder pool (rte_mbuf mode)",
+                               chain->label);
+        }
 
         /* ---- Create per-NF rings and register callbacks ---- */
         for (i = 0; i < num_nfs; i++) {
@@ -165,8 +182,9 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
 
                 if (chain->ring_backend == AFXDP_RING_BE_RTE) {
 #if (AFXDP_DEFAULT_RING_BACKEND == AFXDP_RING_BACKEND_RTE)
-                        /* Create DPDK rte_ring RX */
-                        snprintf(ring_name, sizeof(ring_name), "afxdp_nf%u_rx", i);
+                /* Create DPDK rte_ring RX */
+                        snprintf(ring_name, sizeof(ring_name),
+                                 "%.32s_nf%u_rx", chain->label, i);
                         nf->rx_ring = rte_ring_create(ring_name,
                                         AFXDP_NF_RING_SIZE,
                                         rte_socket_id(),
@@ -177,7 +195,8 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
                         }
 
                         /* Create DPDK rte_ring TX */
-                        snprintf(ring_name, sizeof(ring_name), "afxdp_nf%u_tx", i);
+                        snprintf(ring_name, sizeof(ring_name),
+                                 "%.32s_nf%u_tx", chain->label, i);
                         nf->tx_ring = rte_ring_create(ring_name,
                                         AFXDP_NF_RING_SIZE,
                                         rte_socket_id(),
@@ -227,10 +246,11 @@ afxdp_chain_init(struct afxdp_manager_ctx *ctx, uint16_t num_nfs) {
                 AFXDP_LOG_INFO("Chain: NF %u initialized", i);
         }
 
-        ctx->chain = chain;
+        *out_chain = chain;
 
         AFXDP_LOG_INFO("========================================");
-        AFXDP_LOG_INFO("  NF Chain Initialized: %u NFs", num_nfs);
+        AFXDP_LOG_INFO("  NF Chain [%s] Initialized: %u NFs",
+                       chain->label, num_nfs);
         AFXDP_LOG_INFO("  Ring backend: %s",
                        chain->ring_backend == AFXDP_RING_BE_CUSTOM
                            ? "CUSTOM SPSC" : "DPDK rte_ring");
@@ -460,7 +480,8 @@ void
 afxdp_chain_print_stats(const struct afxdp_chain_ctx *chain) {
         uint16_t i;
 
-        printf("\n--- NF Chain Statistics ---\n");
+        printf("\n--- %s NF Chain Statistics ---\n",
+               chain->label[0] ? chain->label : "Default");
         for (i = 0; i < chain->chain_length; i++) {
                 const struct afxdp_nf *nf = &chain->nfs[i];
                 if (!nf->active)
@@ -479,14 +500,14 @@ afxdp_chain_print_stats(const struct afxdp_chain_ctx *chain) {
 /******************************* Chain Teardown ********************************/
 
 void
-afxdp_chain_teardown(struct afxdp_manager_ctx *ctx) {
-        struct afxdp_chain_ctx *chain = ctx->chain;
+afxdp_chain_teardown(struct afxdp_chain_ctx **chain_ptr) {
+        struct afxdp_chain_ctx *chain = *chain_ptr;
         uint16_t i;
 
         if (!chain)
                 return;
 
-        AFXDP_LOG_INFO("Tearing down NF chain...");
+        AFXDP_LOG_INFO("Tearing down NF chain [%s]...", chain->label);
 
         /* Print final chain stats */
         afxdp_chain_print_stats(chain);
@@ -565,7 +586,7 @@ afxdp_chain_teardown(struct afxdp_manager_ctx *ctx) {
         chain->holder_pool = NULL;
 
         free(chain);
-        ctx->chain = NULL;
+        *chain_ptr = NULL;
 
         AFXDP_LOG_INFO("NF chain teardown complete");
 }
@@ -573,7 +594,11 @@ afxdp_chain_teardown(struct afxdp_manager_ctx *ctx) {
 /******************************* Spec-Based Init *******************************/
 
 int
-afxdp_chain_init_from_spec(struct afxdp_manager_ctx *ctx, const char *spec) {
+afxdp_chain_init_from_spec(struct afxdp_manager_ctx *ctx, const char *spec,
+                           struct afxdp_chain_ctx **out_chain,
+                           struct afxdp_socket_info *xsk,
+                           const char *label,
+                           bool needs_holders) {
         char buf[512];
         char *tokens[AFXDP_MAX_CHAIN_LENGTH];
         uint16_t num_nfs = 0;
@@ -606,15 +631,14 @@ afxdp_chain_init_from_spec(struct afxdp_manager_ctx *ctx, const char *spec) {
                 }
         }
 
-        /* Initialize the chain (creates rings, holder pool) */
-        ret = afxdp_chain_init(ctx, num_nfs);
+        ret = afxdp_chain_init(ctx, num_nfs, out_chain, xsk, label, needs_holders);
         if (ret)
                 return ret;
 
         /* Assign function tables and packet_buffer to each NF */
         for (uint16_t i = 0; i < num_nfs; i++) {
                 struct afxdp_nf_type *type = afxdp_nf_lookup_type(tokens[i]);
-                struct afxdp_nf *nf = &ctx->chain->nfs[i];
+                struct afxdp_nf *nf = &(*out_chain)->nfs[i];
 
                 nf->function_table = &type->ftable;
                 nf->handler = type->ftable.pkt_handler;  /* keep in sync */

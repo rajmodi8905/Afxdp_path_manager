@@ -369,6 +369,9 @@ struct afxdp_service_chain {
  * Owned by the manager context.
  */
 struct afxdp_chain_ctx {
+        /* Human-readable label for stats display (e.g., "Port 0 (AF_XDP)") */
+        char label[64];
+
         /* NF table (indexed by nf_id, supports up to AFXDP_MAX_NFS) */
         struct afxdp_nf nfs[AFXDP_MAX_NFS];
 
@@ -419,8 +422,9 @@ struct afxdp_manager_ctx {
         bool use_hugepages;                   /* true → munmap; false → free()    */
         bool hugepage_preallocated;           /* pre-alloc'd before rte_eal_init()*/
 
-        /* NF Chaining (Phase-1) */
-        struct afxdp_chain_ctx *chain;        /* NULL when chaining is disabled   */
+        /* NF Chaining */
+        struct afxdp_chain_ctx *chain;        /* Port 0 AF_XDP chain (NULL if disabled) */
+        struct afxdp_chain_ctx *chain_dpdk;   /* Port 1 DPDK chain   (NULL if disabled) */
 
         /* ---- Combined Architecture (Port 1 / DPDK) ---- */
         struct afxdp_socket_info *xsk_socket_dpdk;   /* AF_XDP Socket 1 (Slice B)  */

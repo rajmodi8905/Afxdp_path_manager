@@ -64,6 +64,7 @@
 
 #include "onvm_combined_dpdk.h"
 #include "onvm_afxdp.h"
+#include "onvm_afxdp_chain.h"
 
 #include <rte_eal.h>
 #include <rte_lcore.h>
@@ -245,13 +246,10 @@ combined_dpdk_tx(struct afxdp_manager_ctx *ctx,
  *****************************************************************************/
 
 /*
- * DPDK RX thread — polls AF_XDP Socket 1 and distributes packets
- * to openNetVM NFs via rte_ring.
+ * DPDK RX thread — receives from AF_XDP Socket 1, copies to rte_mbuf,
+ * and enqueues into Port 1's NF chain for processing.
  *
- * For the initial version, this is a simple forwarding loop that
- * receives packets and immediately transmits them back out Port 1.
- * The openNetVM NF routing (rte_ring to NF rx_q) will be wired in
- * once the NF manager infrastructure for Port 1 is set up.
+ * If no chain is configured, falls back to loopback mode.
  */
 void *
 combined_dpdk_rx_thread(void *arg) {
@@ -268,56 +266,149 @@ combined_dpdk_rx_thread(void *arg) {
                 if (nb_rx == 0)
                         continue;
 
-                /*
-                 * Phase 1: Simple loopback — forward all received packets
-                 * back out Port 1.  This validates the RX+TX pipeline.
-                 *
-                 * TODO(Phase 2): Route to openNetVM NF rx_q via rte_ring:
-                 *   for (i = 0; i < nb_rx; i++) {
-                 *       uint16_t dest = onvm_get_pkt_destination(bufs[i]);
-                 *       rte_ring_enqueue(nfs[dest].rx_q, bufs[i]);
-                 *   }
-                 */
-                uint16_t nb_tx = combined_dpdk_tx(ctx, bufs, nb_rx);
+                struct afxdp_chain_ctx *chain = ctx->chain_dpdk;
+                if (chain && chain->chain_length > 0) {
+                        /*
+                         * Enqueue rte_mbuf pointers into the first NF's
+                         * rx_ring.  The DPDK NF thread will dequeue,
+                         * process, and enqueue to tx_ring.
+                         */
+                        uint16_t first_nf_id = chain->chain_order[0];
+                        struct afxdp_nf *nf = &chain->nfs[first_nf_id];
 
-                /* Free unsent packets */
-                for (uint16_t i = nb_tx; i < nb_rx; i++)
-                        rte_pktmbuf_free(bufs[i]);
+                        unsigned enqueued = rte_ring_enqueue_burst(
+                                (struct rte_ring *)nf->rx_ring,
+                                (void **)bufs, nb_rx, NULL);
+
+                        /* Free mbufs that couldn't be enqueued (ring full) */
+                        for (uint16_t i = enqueued; i < nb_rx; i++)
+                                rte_pktmbuf_free(bufs[i]);
+                } else {
+                        /* Fallback: loopback when no chain configured */
+                        uint16_t nb_tx = combined_dpdk_tx(ctx, bufs, nb_rx);
+                        for (uint16_t i = nb_tx; i < nb_rx; i++)
+                                rte_pktmbuf_free(bufs[i]);
+                }
         }
 
         AFXDP_LOG_INFO("DPDK RX thread exiting");
         return NULL;
 }
-
 /*
- * DPDK TX thread — drains openNetVM NF tx_q rings and transmits
+ * DPDK TX thread — drains Port 1 NF chain tx_rings and transmits
  * via AF_XDP Socket 1 TX ring.
- *
- * This thread is NOT active in Phase 1 (simple loopback mode).
- * It will be activated when openNetVM NF routing is wired in.
  */
 void *
 combined_dpdk_tx_thread(void *arg) {
         struct afxdp_manager_ctx *ctx = (struct afxdp_manager_ctx *)arg;
-        (void)ctx;  /* Unused in Phase 1 */
 
         afxdp_set_thread_affinity(AFXDP_BASE_CORE + 5);
         AFXDP_LOG_INFO("DPDK TX thread started on core %d",
                        AFXDP_BASE_CORE + 5);
 
         while (!ctx->global_exit) {
-                /*
-                 * TODO(Phase 2): Drain NF tx_q rings and call
-                 * combined_dpdk_tx() to transmit out Port 1.
-                 *
-                 * for (i = 0; i < num_dpdk_nfs; i++) {
-                 *     nb = rte_ring_dequeue_burst(nfs[i].tx_q, bufs, ...);
-                 *     combined_dpdk_tx(ctx, bufs, nb);
-                 * }
-                 */
-                usleep(100);  /* Idle wait in Phase 1 */
+                struct afxdp_chain_ctx *chain = ctx->chain_dpdk;
+                if (!chain) {
+                        usleep(100);
+                        continue;
+                }
+
+                /* Drain each NF's tx_ring and transmit */
+                for (uint16_t n = 0; n < chain->chain_length; n++) {
+                        struct afxdp_nf *nf = &chain->nfs[chain->chain_order[n]];
+                        struct rte_mbuf *bufs[COMBINED_DPDK_BATCH_SIZE];
+                        unsigned dequeued;
+
+                        if (!nf->active || !nf->tx_ring)
+                                continue;
+
+                        dequeued = rte_ring_dequeue_burst(
+                                (struct rte_ring *)nf->tx_ring,
+                                (void **)bufs, COMBINED_DPDK_BATCH_SIZE, NULL);
+
+                        if (dequeued == 0)
+                                continue;
+
+                        /* Update NF TX stats */
+                        for (unsigned j = 0; j < dequeued; j++) {
+                                nf->stats.tx_packets++;
+                                nf->stats.tx_bytes += rte_pktmbuf_pkt_len(bufs[j]);
+                        }
+
+                        uint16_t nb_tx = combined_dpdk_tx(ctx, bufs, dequeued);
+
+                        /* Free unsent packets */
+                        for (uint16_t i = nb_tx; i < dequeued; i++) {
+                                nf->stats.dropped++;
+                                rte_pktmbuf_free(bufs[i]);
+                        }
+                }
         }
 
         AFXDP_LOG_INFO("DPDK TX thread exiting");
+        return NULL;
+}
+
+/*
+ * DPDK NF thread — runs a dummy NF processing loop for Port 1.
+ *
+ * Dequeues rte_mbuf pointers from the NF's rx_ring, "processes" them,
+ * and enqueues to the NF's tx_ring for egress.
+ *
+ * Uses the same arg struct (afxdp_dummy_nf_arg) as Port 0 NF threads.
+ * The struct is defined in onvm_afxdp.c but the layout is trivial
+ * (ctx pointer + nf_idx), so we redefine it here to avoid header coupling.
+ */
+struct combined_dpdk_nf_arg {
+        struct afxdp_manager_ctx *ctx;
+        uint16_t nf_idx;
+};
+
+void *
+combined_dpdk_nf_thread(void *arg) {
+        struct combined_dpdk_nf_arg *nf_arg = (struct combined_dpdk_nf_arg *)arg;
+        struct afxdp_manager_ctx *ctx = nf_arg->ctx;
+        struct afxdp_chain_ctx *chain = ctx->chain_dpdk;
+        struct afxdp_nf *nf = &chain->nfs[nf_arg->nf_idx];
+
+        afxdp_set_thread_affinity(AFXDP_BASE_CORE + 6 + nf_arg->nf_idx);
+        AFXDP_LOG_INFO("DPDK NF %u thread started on core %d",
+                       nf->nf_id, AFXDP_BASE_CORE + 6 + nf_arg->nf_idx);
+
+        while (!ctx->global_exit) {
+                struct rte_mbuf *batch[COMBINED_DPDK_BATCH_SIZE];
+                unsigned dequeued, j;
+
+                dequeued = rte_ring_dequeue_burst(
+                        (struct rte_ring *)nf->rx_ring,
+                        (void **)batch, COMBINED_DPDK_BATCH_SIZE, NULL);
+
+                if (dequeued == 0)
+                        continue;
+
+                for (j = 0; j < dequeued; j++) {
+                        nf->stats.rx_packets++;
+                        nf->stats.rx_bytes += rte_pktmbuf_pkt_len(batch[j]);
+
+                        /*
+                         * Dummy NF: pass-through.
+                         * A real NF would inspect/modify the mbuf here.
+                         */
+                }
+
+                /* Enqueue processed mbufs to NF's tx_ring */
+                unsigned enqueued = rte_ring_enqueue_burst(
+                        (struct rte_ring *)nf->tx_ring,
+                        (void **)batch, dequeued, NULL);
+
+                /* Free mbufs that couldn't be enqueued */
+                for (j = enqueued; j < dequeued; j++) {
+                        nf->stats.dropped++;
+                        rte_pktmbuf_free(batch[j]);
+                }
+        }
+
+        AFXDP_LOG_INFO("DPDK NF %u thread exited", nf->nf_id);
+        free(nf_arg);
         return NULL;
 }

@@ -65,6 +65,10 @@
 #include "onvm_afxdp.h"
 #include "onvm_afxdp_chain.h"
 
+#ifdef USE_COMBINED
+#include "onvm_combined_dpdk.h"
+#endif
+
 #include <rte_ring.h>
 #include <rte_mempool.h>
 
@@ -1748,12 +1752,25 @@ afxdp_mgr_thread_main(void *arg) {
 
                 if (ctx->cfg.verbose) {
                         xsk->stats.timestamp = afxdp_gettime();
+                        if (ctx->cfg.combined_mode)
+                                printf("Port 0 (AF_XDP) ");
                         afxdp_stats_print(&xsk->stats, &previous);
                         previous = xsk->stats;
 
-                        /* Print per-NF chain stats */
+                        /* Print per-NF chain stats (Port 0) */
                         if (ctx->chain)
                                 afxdp_chain_print_stats(ctx->chain);
+
+                        /* Print Port 1 stats (combined mode) */
+                        if (ctx->cfg.combined_mode && ctx->xsk_socket_dpdk) {
+                                struct afxdp_socket_info *xsk1 = ctx->xsk_socket_dpdk;
+                                xsk1->stats.timestamp = afxdp_gettime();
+                                printf("Port 1 (DPDK) ");
+                                afxdp_stats_print(&xsk1->stats, &xsk1->prev_stats);
+                                xsk1->prev_stats = xsk1->stats;
+                        }
+                        if (ctx->chain_dpdk)
+                                afxdp_chain_print_stats(ctx->chain_dpdk);
                 }
 
                 if (ctx->cfg.time_to_live) {
@@ -2009,18 +2026,36 @@ afxdp_init(struct afxdp_manager_ctx *ctx, int argc, char **argv) {
                 AFXDP_LOG_INFO("--- Port 1 Initialization Complete ---");
         }
 
-        /* ---- Step 10: Initialize NF chain ---- */
+        /* ---- Step 10: Initialize Port 0 NF chain ---- */
         {
                 int chain_err;
                 if (ctx->cfg.use_real_nfs) {
-                        chain_err = afxdp_chain_init_from_spec(ctx, ctx->cfg.nf_chain_spec);
+                        chain_err = afxdp_chain_init_from_spec(
+                                ctx, ctx->cfg.nf_chain_spec,
+                                &ctx->chain, ctx->xsk_socket,
+                                "Port 0 (AF_XDP)", true);
                 } else {
-                        chain_err = afxdp_chain_init(ctx, 1);
+                        chain_err = afxdp_chain_init(
+                                ctx, 1,
+                                &ctx->chain, ctx->xsk_socket,
+                                "Port 0 (AF_XDP)", true);
                 }
                 if (chain_err) {
                         AFXDP_LOG_ERR("NF chain initialization failed (err=%d)",
                                       chain_err);
                         AFXDP_LOG_WARN("Running in legacy bounce mode (no NF chain)");
+                }
+        }
+
+        /* ---- Step 10b: Initialize Port 1 NF chain (combined mode) ---- */
+        if (ctx->cfg.combined_mode && ctx->xsk_socket_dpdk) {
+                int chain_err = afxdp_chain_init(
+                        ctx, 1,
+                        &ctx->chain_dpdk, ctx->xsk_socket_dpdk,
+                        "Port 1 (DPDK)", false);
+                if (chain_err) {
+                        AFXDP_LOG_ERR("Port 1 NF chain initialization failed");
+                        AFXDP_LOG_WARN("Port 1 running without NF chain");
                 }
         }
 
@@ -2122,6 +2157,51 @@ afxdp_run(struct afxdp_manager_ctx *ctx) {
                 }
         }
 
+#ifdef USE_COMBINED
+        /* ---- Port 1 NF threads (one per NF in chain_dpdk, DPDK mode) ---- */
+        uint16_t num_dpdk_nf_threads = 0;
+        pthread_t dpdk_nf_threads[AFXDP_MAX_NFS];
+        pthread_t dpdk_tx_tid;
+        bool dpdk_tx_launched = false;
+
+        if (ctx->chain_dpdk &&
+            ctx->chain_dpdk->ring_backend == AFXDP_RING_BE_RTE) {
+                num_dpdk_nf_threads = ctx->chain_dpdk->chain_length;
+
+                AFXDP_LOG_INFO("Launching %u DPDK NF threads for Port 1",
+                               num_dpdk_nf_threads);
+                for (i = 0; i < (int)num_dpdk_nf_threads; i++) {
+                        /* Use combined_dpdk_nf_arg which mirrors afxdp_dummy_nf_arg layout */
+                        struct {
+                                struct afxdp_manager_ctx *ctx;
+                                uint16_t nf_idx;
+                        } *dpdk_arg = malloc(sizeof(*dpdk_arg));
+                        dpdk_arg->ctx = ctx;
+                        dpdk_arg->nf_idx = i;
+                        err = pthread_create(&dpdk_nf_threads[i], NULL,
+                                              combined_dpdk_nf_thread, dpdk_arg);
+                        if (err) {
+                                AFXDP_LOG_ERR("Failed to create DPDK NF thread %d: %s",
+                                              i, strerror(err));
+                                free(dpdk_arg);
+                                ctx->global_exit = true;
+                                break;
+                        }
+                }
+
+                /* Launch DPDK TX thread */
+                err = pthread_create(&dpdk_tx_tid, NULL,
+                                      combined_dpdk_tx_thread, ctx);
+                if (err) {
+                        AFXDP_LOG_ERR("Failed to create DPDK TX thread: %s",
+                                      strerror(err));
+                        ctx->global_exit = true;
+                } else {
+                        dpdk_tx_launched = true;
+                }
+        }
+#endif /* USE_COMBINED */
+
         /* ---- Mgr threads ---- */
         for (i = 0; i < AFXDP_NUM_MGR_AUX_THREADS; i++) {
                 err = pthread_create(&mgr_threads[i], NULL,
@@ -2153,6 +2233,15 @@ afxdp_run(struct afxdp_manager_ctx *ctx) {
                 pthread_join(tx_threads[i], NULL);
         for (i = 0; i < (int)num_nf_threads; i++)
                 pthread_join(nf_threads[i], NULL);
+
+#ifdef USE_COMBINED
+        /* Join Port 1 threads */
+        for (i = 0; i < (int)num_dpdk_nf_threads; i++)
+                pthread_join(dpdk_nf_threads[i], NULL);
+        if (dpdk_tx_launched)
+                pthread_join(dpdk_tx_tid, NULL);
+#endif
+
         for (i = 0; i < AFXDP_NUM_MGR_AUX_THREADS; i++)
                 pthread_join(mgr_threads[i], NULL);
         for (i = 0; i < AFXDP_NUM_WAKEUP_THREADS; i++)
@@ -2178,19 +2267,30 @@ afxdp_cleanup(struct afxdp_manager_ctx *ctx, bool final_cleanup) {
 
         /* Worker threads are joined in afxdp_run(). */
 
-        /* Tear down NF chain (prints final chain stats) */
+        /* Tear down NF chains (prints final chain stats) */
+        if (ctx->chain_dpdk)
+                afxdp_chain_teardown(&ctx->chain_dpdk);
         if (ctx->chain)
-                afxdp_chain_teardown(ctx);
+                afxdp_chain_teardown(&ctx->chain);
 
         /* Print final statistics */
         if (ctx->xsk_socket) {
-                printf("\n--- Final Statistics ---\n");
+                printf("\n--- Final Statistics: Port 0 (AF_XDP) ---\n");
                 printf("RX: %lu packets, %lu bytes\n",
                        ctx->xsk_socket->stats.rx_packets,
                        ctx->xsk_socket->stats.rx_bytes);
                 printf("TX: %lu packets, %lu bytes\n",
                        ctx->xsk_socket->stats.tx_packets,
                        ctx->xsk_socket->stats.tx_bytes);
+        }
+        if (ctx->xsk_socket_dpdk) {
+                printf("\n--- Final Statistics: Port 1 (DPDK) ---\n");
+                printf("RX: %lu packets, %lu bytes\n",
+                       ctx->xsk_socket_dpdk->stats.rx_packets,
+                       ctx->xsk_socket_dpdk->stats.rx_bytes);
+                printf("TX: %lu packets, %lu bytes\n",
+                       ctx->xsk_socket_dpdk->stats.tx_packets,
+                       ctx->xsk_socket_dpdk->stats.tx_bytes);
         }
 
         /* ---- Combined Mode: Tear down Port 1 resources ---- */

@@ -425,8 +425,9 @@ main(int argc, char *argv[]) {
                 }
 
                 /* Launch DPDK RX thread for Port 1.
-                 * Phase 1: simple loopback (RX -> TX on same port).
-                 * Phase 2: will route to openNetVM NFs via rte_ring. */
+                 * Receives packets from AF_XDP Socket 1, copies to rte_mbuf,
+                 * and enqueues into Port 1's NF chain (chain_dpdk).
+                 * NF and TX threads for Port 1 are launched in afxdp_run(). */
                 {
                         pthread_t dpdk_rx_tid;
                         if (pthread_create(&dpdk_rx_tid, NULL,
